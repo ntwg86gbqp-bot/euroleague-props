@@ -1,0 +1,250 @@
+"""Αποδόσεις: OddsPapi API, χειροκίνητη εισαγωγή / CSV, αντιστοίχιση ονομάτων."""
+from __future__ import annotations
+import datetime as dt
+import difflib
+import json
+import re
+import time
+import unicodedata
+import pandas as pd
+import requests
+
+from .db import DATA_DIR
+
+BASE = "https://api.oddspapi.io/v4"
+EUROLEAGUE_TOURNAMENT = 138
+BASKETBALL_SPORT = 11
+CONFIG = DATA_DIR / "config.json"
+MARKETS_CACHE = DATA_DIR / "oddspapi_markets.json"
+DEFAULT_BOOKS = "pinnacle,bet365,betano,stoiximan,novibet,bwin"
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+# ---------- ονόματα ----------
+
+_SUFFIX = {"JR", "SR", "II", "III", "IV"}
+
+
+def norm_name(s: str) -> str:
+    """'LARKIN, SHANE' και 'Shane Larkin' -> 'LARKIN SHANE'."""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c)).upper()
+    toks = [t for t in re.split(r"[^A-Z]+", s) if t and t not in _SUFFIX]
+    return " ".join(sorted(toks))
+
+
+class PlayerIndex:
+    def __init__(self, players: pd.DataFrame):
+        """players: index=player_id, στήλη 'player'."""
+        self.by_norm: dict[str, list[str]] = {}
+        for pid, name in players["player"].items():
+            self.by_norm.setdefault(norm_name(name), []).append(pid)
+
+    def match(self, raw: str) -> str | None:
+        n = norm_name(raw)
+        if n in self.by_norm:
+            ids = self.by_norm[n]
+            return ids[0] if len(ids) == 1 else None
+        # αρχικό + επώνυμο (π.χ. 'S. Larkin') ή υποσύνολο tokens
+        toks = set(n.split())
+        cands = []
+        for key, ids in self.by_norm.items():
+            kt = set(key.split())
+            if len(toks) >= 2 and (toks <= kt or kt <= toks):
+                cands += ids
+            elif len(toks) == 2:
+                long = [t for t in toks if len(t) > 1]
+                short = [t for t in toks if len(t) == 1]
+                if len(long) == 1 and short and long[0] in kt and any(
+                        k.startswith(short[0]) for k in kt - {long[0]}):
+                    cands += ids
+        if len(set(cands)) == 1:
+            return cands[0]
+        close = difflib.get_close_matches(n, list(self.by_norm), n=2, cutoff=0.86)
+        if len(close) == 1 and len(self.by_norm[close[0]]) == 1:
+            return self.by_norm[close[0]][0]
+        return None
+
+
+# ---------- αγορές ----------
+
+_STAT_WORDS = [("pts", r"\bpoints?\b|\bpts\b"), ("reb", r"rebound|\breb\b"),
+               ("ast", r"assist|\bast\b"), ("fg3m", r"three|3[- ]?point|\b3pt|threes|triples"),
+               ("fg2m", r"\btwos?\b|two[- ]point|\b2pt"),
+               ("stl", r"steal"), ("blk", r"block"), ("tov", r"turnover")]
+_COMBO = {frozenset(["pts", "reb", "ast"]): "pra", frozenset(["pts", "reb"]): "pr",
+          frozenset(["pts", "ast"]): "pa", frozenset(["reb", "ast"]): "ra",
+          frozenset(["stl", "blk"]): "stl_blk"}
+
+
+def stat_from_market_name(name: str) -> str | None:
+    """Αντιστοιχίζει όνομα αγοράς σε εσωτερικό κλειδί. None αν δεν αναγνωρίζεται
+    ή αν αφορά περίοδο/ημίχρονο/double-double κ.λπ."""
+    n = name.lower()
+    if re.search(r"quarter|half|1st|2nd|3rd|4th|double|first|last|most|race|odd|even", n):
+        return None
+    n = n.replace("3-point", "three").replace("3 point", "three")
+    n = n.replace("2-point", "two").replace("2 point", "two")
+    found = [k for k, pat in _STAT_WORDS if re.search(pat, n)]
+    if ("fg3m" in found or "fg2m" in found) and "pts" in found and not re.search(r"\+|&| and ", n):
+        found.remove("pts")  # 'three points made' είναι τρίποντα, όχι πόντοι
+    if len(found) == 1:
+        return found[0]
+    return _COMBO.get(frozenset(found))
+
+
+def side_from_outcome(name: str) -> str | None:
+    n = str(name).lower()
+    if "over" in n:
+        return "over"
+    if "under" in n:
+        return "under"
+    return None
+
+
+# ---------- OddsPapi ----------
+
+class OddsPapiError(RuntimeError):
+    pass
+
+
+def _get(path: str, key: str, **params):
+    q = {k: v for k, v in params.items() if v is not None}
+    q["apiKey"] = key
+    for attempt in range(4):
+        r = requests.get(f"{BASE}/{path}", params=q, timeout=120)
+        if r.status_code == 429:
+            time.sleep(3 * (attempt + 1))
+            continue
+        if r.status_code == 404:
+            return None
+        if r.status_code in (401, 403):
+            raise OddsPapiError(f"Το API απέρριψε το κλειδί ({r.status_code}): {r.text[:200]}")
+        r.raise_for_status()
+        time.sleep(1.1)  # cooldown ανά endpoint
+        return r.json()
+    raise OddsPapiError(f"Όριο αιτημάτων στο /{path}")
+
+
+def prop_markets(key: str, refresh: bool = False) -> dict[str, dict]:
+    """marketId -> {name, stat, line, outcomes{outcomeId: side}} για ειδικά παικτών μπάσκετ."""
+    if MARKETS_CACHE.exists() and not refresh:
+        return json.loads(MARKETS_CACHE.read_text())
+    out = {}
+    for m in _get("markets", key) or []:
+        if m.get("sportId") != BASKETBALL_SPORT or not m.get("playerProp"):
+            continue
+        out[str(m["marketId"])] = {
+            "name": m.get("marketName", ""), "stat": stat_from_market_name(m.get("marketName", "")),
+            "line": m.get("handicap"),
+            "outcomes": {str(o["outcomeId"]): side_from_outcome(o.get("outcomeName", ""))
+                         for o in m.get("outcomes", [])}}
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MARKETS_CACHE.write_text(json.dumps(out))
+    return out
+
+
+def parse_fixture_odds(odds: dict, markets: dict[str, dict]) -> tuple[list[dict], set[str]]:
+    """Επιστρέφει (γραμμές, ονόματα αγορών παικτών που δεν αναγνωρίστηκαν)."""
+    rows, unknown = [], set()
+    for book, board in (odds or {}).get("bookmakerOdds", {}).items():
+        for mid, market in (board.get("markets") or {}).items():
+            meta = markets.get(str(mid))
+            if not meta:
+                continue
+            if not meta["stat"] or meta["line"] is None:
+                unknown.add(meta["name"])
+                continue
+            for oid, leg in (market.get("outcomes") or {}).items():
+                side = meta["outcomes"].get(str(oid))
+                if not side:
+                    continue
+                for _pid, pl in (leg.get("players") or {}).items():
+                    if not pl.get("active") or not pl.get("price") or not pl.get("playerName"):
+                        continue
+                    rows.append({"bookmaker": book, "player_raw": pl["playerName"],
+                                 "stat": meta["stat"], "line": float(meta["line"]),
+                                 "side": side, "price": float(pl["price"])})
+    return rows, unknown
+
+
+def fetch_oddspapi(key: str, bookmakers: str = DEFAULT_BOOKS, days: int = 7,
+                   progress=None) -> dict:
+    """Τραβάει ειδικά παικτών για τα επερχόμενα παιχνίδια Euroleague."""
+    markets = prop_markets(key, refresh=True)
+    now = dt.datetime.now(dt.timezone.utc)
+    fixtures = _get("fixtures", key, tournamentId=EUROLEAGUE_TOURNAMENT,
+                    **{"from": now.strftime("%Y-%m-%d"),
+                       "to": (now + dt.timedelta(days=days)).strftime("%Y-%m-%d")}) or []
+    iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    upcoming = [f for f in fixtures if f.get("hasOdds") and f.get("startTime", "") > iso]
+    rows, unknown = [], set()
+    for i, f in enumerate(upcoming):
+        if progress:
+            progress((i + 1) / len(upcoming),
+                     f"{f.get('participant1Name')} - {f.get('participant2Name')}")
+        o = _get("odds", key, fixtureId=f["fixtureId"], bookmakers=bookmakers or None)
+        r, u = parse_fixture_odds(o, markets)
+        rows += r
+        unknown |= u
+    return {"rows": rows, "n_prop_markets": len(markets),
+            "n_mapped_markets": sum(1 for m in markets.values() if m["stat"]),
+            "n_fixtures": len(fixtures), "n_upcoming": len(upcoming), "unknown": sorted(unknown)}
+
+
+# ---------- αποθήκευση ----------
+
+def store(con, rows: list[dict], index: PlayerIndex, source: str) -> tuple[int, list[str]]:
+    """Γράφει ένα νέο στιγμιότυπο. Επιστρέφει (πλήθος, ονόματα που δεν ταίριαξαν)."""
+    ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    unmatched, n = set(), 0
+    for r in rows:
+        pid = r.get("player_id") or index.match(r["player_raw"])
+        if not pid:
+            unmatched.add(r["player_raw"])
+            continue
+        con.execute("INSERT INTO odds(fetched_at, source, bookmaker, player_raw, player_id, stat,"
+                    " line, side, price) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (ts, source, r.get("bookmaker") or "—", r["player_raw"], pid, r["stat"],
+                     float(r["line"]), r["side"], float(r["price"])))
+        n += 1
+    con.commit()
+    return n, sorted(unmatched)
+
+
+def latest(con, max_age_hours: float = 72) -> pd.DataFrame:
+    """Τελευταία τιμή ανά (bookmaker, παίκτης, αγορά, γραμμή, πλευρά)."""
+    df = pd.read_sql_query("SELECT * FROM odds", con)
+    if df.empty:
+        return df
+    df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True)
+    cut = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=max_age_hours)
+    df = df[df["fetched_at"] >= cut]
+    return (df.sort_values("fetched_at")
+              .drop_duplicates(["bookmaker", "player_id", "stat", "line", "side"], keep="last"))
+
+
+def wide_to_rows(df: pd.DataFrame) -> list[dict]:
+    """Πίνακας (player, stat, line, over, under, bookmaker) -> γραμμές ανά πλευρά."""
+    rows = []
+    for r in df.to_dict("records"):
+        if not r.get("player") or pd.isna(r.get("line")) or not r.get("stat"):
+            continue
+        for side in ("over", "under"):
+            price = r.get(side)
+            if price is not None and not pd.isna(price) and float(price) > 1:
+                rows.append({"player_raw": str(r["player"]), "player_id": r.get("player_id"),
+                             "stat": r["stat"], "line": float(r["line"]), "side": side,
+                             "price": float(price), "bookmaker": r.get("bookmaker") or "χειροκίνητα"})
+    return rows
