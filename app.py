@@ -79,13 +79,13 @@ def home_screen_icon():
     b64 = _touch_icon_b64()
     if not b64:
         return
-    import streamlit.components.v1 as components
-    components.html(f"""<script>
+    import inspect
+    html = f"""<script>
     (function () {{
       const href = "data:image/png;base64,{b64}";
-      const wins = [];
-      try {{ wins.push(window.parent); }} catch (e) {{}}
-      try {{ if (window.top !== window.parent) wins.push(window.top); }} catch (e) {{}}
+      const wins = [window];
+      try {{ if (window.parent !== window) wins.push(window.parent); }} catch (e) {{}}
+      try {{ if (!wins.includes(window.top)) wins.push(window.top); }} catch (e) {{}}
       for (const w of wins) {{
         try {{
           const d = w.document;
@@ -104,7 +104,14 @@ def home_screen_icon():
         }} catch (e) {{}}
       }}
     }})();
-    </script>""", height=0)
+    </script>"""
+    # νέα Streamlit: το script τρέχει μέσα στη σελίδα· παλιά (π.χ. στο Mac): μέσα σε iframe ύψους 0
+    if "unsafe_allow_javascript" in inspect.signature(st.html).parameters:
+        st.html(html, unsafe_allow_javascript=True)
+    else:
+        import streamlit.components.v1 as components
+        components.html(html, height=0)
+
 
 st.markdown(f"""
 <style>
