@@ -56,7 +56,55 @@ GLOSS = {
     "Ακυρώθηκε": "Ο παίκτης δεν αγωνίστηκε, οπότε το στοίχημα δεν μετράει και το ποντάρισμα επιστρέφεται.",
 }
 
-st.set_page_config(page_title="Euroleague Props", page_icon="🏀", layout="wide")
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+st.set_page_config(page_title="Euroleague Props", layout="wide",
+                   page_icon=os.path.join(_ASSETS, "favicon.png") if os.path.exists(os.path.join(_ASSETS, "favicon.png")) else "🏀")
+
+
+@st.cache_data
+def _touch_icon_b64() -> str | None:
+    import base64
+    try:
+        with open(os.path.join(_ASSETS, "apple-touch-icon.png"), "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except OSError:
+        return None
+
+
+def home_screen_icon():
+    """Εικονίδιο και όνομα για «Προσθήκη στην οθόνη Αφετηρίας» (iPhone) και για Android.
+
+    Το iPhone διαβάζει το <link rel="apple-touch-icon"> της ΕΞΩΤΕΡΙΚΗΣ σελίδας. Στο Streamlit Cloud η εφαρμογή
+    τρέχει μέσα σε iframe της ίδιας διεύθυνσης, οπότε το βάζουμε και στο parent και στο top."""
+    b64 = _touch_icon_b64()
+    if not b64:
+        return
+    import streamlit.components.v1 as components
+    components.html(f"""<script>
+    (function () {{
+      const href = "data:image/png;base64,{b64}";
+      const wins = [];
+      try {{ wins.push(window.parent); }} catch (e) {{}}
+      try {{ if (window.top !== window.parent) wins.push(window.top); }} catch (e) {{}}
+      for (const w of wins) {{
+        try {{
+          const d = w.document;
+          if (d.querySelector('link[data-elprops]')) continue;
+          d.querySelectorAll('link[rel="apple-touch-icon"], link[rel="apple-touch-icon-precomposed"]').forEach(e => e.remove());
+          const l = d.createElement('link'); l.rel = 'apple-touch-icon'; l.sizes = '180x180'; l.href = href;
+          l.setAttribute('data-elprops', '1'); d.head.appendChild(l);
+          const ic = d.createElement('link'); ic.rel = 'icon'; ic.type = 'image/png'; ic.href = href; d.head.appendChild(ic);
+          const meta = (n, c) => {{ let m = d.querySelector('meta[name="' + n + '"]');
+            if (!m) {{ m = d.createElement('meta'); m.name = n; d.head.appendChild(m); }} m.content = c; }};
+          meta('apple-mobile-web-app-title', 'EL Props');
+          meta('application-name', 'EL Props');
+          meta('apple-mobile-web-app-capable', 'yes');
+          meta('apple-mobile-web-app-status-bar-style', 'black-translucent');
+          meta('theme-color', '#10151F');
+        }} catch (e) {{}}
+      }}
+    }})();
+    </script>""", height=0)
 
 st.markdown(f"""
 <style>
@@ -131,8 +179,12 @@ st.markdown(f"""
   .el-verdict .t {{ font-size: 1rem; }}
   [data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
 }}
+[data-testid="stElementContainer"]:has(iframe[height="0"]) {{ display: none; }}
 .el-gloss dd {{ color: var(--muted); margin: 0; font-size: .84rem; line-height: 1.4; }}
 </style>""", unsafe_allow_html=True)
+
+
+home_screen_icon()
 
 
 def _auto_mobile() -> bool:
