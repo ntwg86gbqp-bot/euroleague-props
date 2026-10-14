@@ -241,6 +241,7 @@ def build(odds: pd.DataFrame, df: pd.DataFrame, current: pd.DataFrame, ctx: dict
                 "Στοίχημα": f"{'Over' if side == 'over' else 'Under'} {line:g} {M.STATS[stat][0]}",
                 "Γιατί": explain(vd, side, pm_side, pk_side, l10, f_o, M.STATS[stat][0], n_g, eff["min"])
                          + (" · λείπει: " + ", ".join(n.split(",")[0].title() for n in eff["out"]) if eff["out"] else "")
+                         + (" · " + rn if (rn := M.role_note(pid, ctx, current)) else "")
                          + (" · ψηλή γραμμή: το μοντέλο υπερεκτιμά τις μεγάλες βραδιές" if tail and vd == "suspect" else "")
                          + (f" · η απόδοση είναι πολύ πάνω από τις άλλες {n_books} εταιρείες (τυπική {typ:.2f}): "
                             "πιθανό λάθος ή παλιά γραμμή" if outlier and vd == "suspect" else ""),
@@ -261,6 +262,7 @@ def build(odds: pd.DataFrame, df: pd.DataFrame, current: pd.DataFrame, ctx: dict
                 "L5": f"{l5[0]}/{l5[1]}", "L10": f"{l10[0]}/{l10[1]}",
                 "Σεζόν": f"{ss[0]}/{ss[1]}", "hit10": l10[0] / l10[1] if l10[1] else np.nan,
                 "Αγώνες": n_g, "Γκανιότα": margin, "Εταιρείες αγοράς": n_books,
+                "Νέος ρόλος": bool(M.role_note(pid, ctx, current)),
             })
     out = pd.DataFrame(rows)
     return out.sort_values("EV", ascending=False).reset_index(drop=True) if len(out) else out

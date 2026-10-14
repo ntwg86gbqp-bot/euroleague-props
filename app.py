@@ -54,6 +54,8 @@ GLOSS = {
     "Απουσίες": "Παίκτες που δηλώνεις ότι δεν θα παίξουν. Οι προβλέψεις των συμπαικτών τους ανεβαίνουν ανάλογα.",
     "Απόδοση επένδυσης": "Κέρδος ή ζημιά ως ποσοστό όσων ποντάρισες. +5% σημαίνει 5 € κέρδος για κάθε 100 € που έπαιξες.",
     "Ακυρώθηκε": "Ο παίκτης δεν αγωνίστηκε, οπότε το στοίχημα δεν μετράει και το ποντάρισμα επιστρέφεται.",
+    "Νέος ρόλος ⚠️": "Άλλαξε ομάδα ή παίζει φέτος τουλάχιστον 6′ διαφορετικά από πέρσι. Το μοντέλο διορθώνει τον ρυθμό του, "
+                    "αλλά με λίγους φετινούς αγώνες η πρόβλεψη είναι πιο αβέβαιη.",
 }
 
 _ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -352,7 +354,8 @@ if SYNC:
 
 def data_sig():
     return con.execute("SELECT (SELECT COUNT(*) FROM box), (SELECT COALESCE(SUM(pts),0) FROM box), "
-                       "(SELECT COUNT(*) FROM players WHERE position IS NOT NULL)").fetchone()
+                       "(SELECT COUNT(*) FROM players WHERE position IS NOT NULL), "
+                       "(SELECT COALESCE(GROUP_CONCAT(player_id), '') FROM only_current)").fetchone()
 
 
 @st.cache_resource(show_spinner="Υπολογισμός μοντέλου…")
@@ -360,7 +363,7 @@ def compute(sig):
     df = M.load_frame(con)
     if df.empty:
         return None
-    preds, current, ctx = M.walk_forward(df, positions=M.load_positions(con))
+    preds, current, ctx = M.walk_forward(df, positions=M.load_positions(con), only_current=M.load_only_current(con))
     ctx["height"] = {pid: h for pid, h in con.execute(
         "SELECT player_id, height FROM players WHERE height IS NOT NULL ORDER BY season")}
     disp = M.fit_dispersion(preds) if len(preds) else {k: (0.15, 40.0) for k in M.KEYS}
@@ -411,6 +414,48 @@ def board_for(D, nxt, w_model):
 
 # ------------------------------------------------------------------ παίκτης
 
+def season_compare(D, pid: str, key: str):
+    """Φέτος δίπλα σε πέρσι, σήμανση «νέος ρόλος» και επιλογή «μέτρα μόνο τη φετινή σεζόν»."""
+    h = D["df"][D["df"]["player_id"] == pid]
+    seasons = sorted(h["season"].unique())
+    note = M.role_note(pid, D["ctx"], D["current"])
+    only = pid in M.load_only_current(con)
+    cs = int(D["df"]["season"].max())
+    if note:
+        st.markdown(f'<div class="el-leg" style="color:{WARN}">⚠️ {esc(note[0].upper() + note[1:])}. '
+                    'Το μοντέλο το λαμβάνει υπόψη, αλλά με λίγους φετινούς αγώνες η πρόβλεψη είναι πιο αβέβαιη.</div>',
+                    unsafe_allow_html=True)
+    if len(seasons) >= 2 or only:
+        with st.expander("Φέτος έναντι πέρσι" + (" · νέος ρόλος" if note and not only else ""), expanded=bool(note)):
+            rows = []
+            for s_ in seasons[-2:]:
+                x = h[h["season"] == s_]
+                m = x["minutes"].sum()
+                rows.append({"Σεζόν": f"{s_}-{str(s_ + 1)[-2:]}", "Ομάδα": x["team"].iloc[-1], "Αγώνες": len(x),
+                             "Λεπτά": x["minutes"].mean(), "Πόντοι": x["pts"].mean(), "Ριμπάουντ": x["reb"].mean(),
+                             "Ασίστ": x["ast"].mean(), "Τρίποντα": x["fg3m"].mean(),
+                             "Πόντοι / 36′": 36 * x["pts"].sum() / m if m else np.nan})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                         column_config={c: st.column_config.NumberColumn(format="%.1f")
+                                        for c in ("Λεπτά", "Πόντοι", "Ριμπάουντ", "Ασίστ", "Τρίποντα", "Πόντοι / 36′")}
+                         | {"Πόντοι / 36′": st.column_config.NumberColumn(format="%.1f", help="Πόντοι ανά 36 λεπτά: δείχνει αν άλλαξε ο ρόλος του στην επίθεση, ανεξάρτητα από τα λεπτά.")})
+            new = st.toggle("Μέτρα μόνο τη φετινή σεζόν", value=only, key=f"{key}_only_{pid}",
+                            help="Για όταν ξέρεις ότι ο ρόλος του άλλαξε ουσιαστικά (π.χ. έγινε βασικός). Το μοντέλο αγνοεί εντελώς "
+                                 "τα περσινά του. Προσοχή: με λίγους φετινούς αγώνες η πρόβλεψη γίνεται πιο θορυβώδης. "
+                                 "Στον έλεγχο, το να αγνοείται το πέρσι για όλους χειροτέρευε τις προβλέψεις.")
+            if new != only:
+                if new:
+                    con.execute("INSERT OR REPLACE INTO only_current VALUES (?, ?)",
+                                (pid, pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds")))
+                else:
+                    con.execute("DELETE FROM only_current WHERE player_id=?", (pid,))
+                con.commit()
+                st.session_state.pop("_board", None)
+                st.rerun()
+            if (h["season"] == cs).sum() < 3 and new:
+                st.caption(f"Έχει μόνο {(h['season'] == cs).sum()} φετινούς αγώνες: η πρόβλεψη στηρίζεται κυρίως στον μέσο όρο της λίγκας.")
+
+
 def render_player(D, nxt, pid: str, stat: str, line: float, over=None, under=None, key="p",
                   side: str = "over", w_model: float = 0.5):
     df, current, disp = D["df"], D["current"], D["disp"]
@@ -436,6 +481,7 @@ def render_player(D, nxt, pid: str, stat: str, line: float, over=None, under=Non
 
     if pid in D["ctx"].get("absent", set()):
         st.warning("Τον έχεις δηλώσει απόντα. Αν τελικά παίζει, ξετσέκαρέ τον στη σελίδα «Αγώνας».")
+    season_compare(D, pid, key)
     if eff["out"]:
         st.markdown(
             f'<div class="el-leg">Λείπει: <b>{esc(", ".join(n.title() for n in eff["out"]))}</b>. Γι\' αυτό η πρόβλεψη '
@@ -685,12 +731,16 @@ def page_value(D, nxt, w_model):
         teams = f[1].multiselect("Ομάδες", sorted(b["Ομάδα"].unique()), placeholder="Όλες")
         side = f[2].selectbox("Πλευρά", ["Όλες", "Over", "Under"])
         min_g = f[3].number_input("Ελάχιστοι αγώνες ιστορικού", value=8, step=1, min_value=0)
-    t1, t2 = st.columns(2)
+    t1, t2, t3 = st.columns(3)
     hide_no = t1.toggle("Κρύψε όσα δεν αξίζουν", True)
     detail = t2.toggle("Αναλυτικές στήλες", False)
+    no_role = t3.toggle("Κρύψε παίκτες με νέο ρόλο", False,
+                        help="Άλλαξαν ομάδα ή παίζουν τουλάχιστον 6′ διαφορετικά από πέρσι. Εκεί η πρόβλεψη είναι πιο αβέβαιη.")
     v = b[b["Αγώνες"] >= min_g]
     if hide_no:
         v = v[v["verdict"] != "no"]
+    if no_role and "Νέος ρόλος" in v:
+        v = v[~v["Νέος ρόλος"]]
     if stats:
         v = v[v["stat"].isin(stats)]
     if poss:
@@ -707,7 +757,7 @@ def page_value(D, nxt, w_model):
         heading(st, "Όλα τα στοιχήματα", f"{len(v)} στοιχήματα, τα καλύτερα πρώτα. Διάλεξε ένα από τη λίστα στο τέλος για την ανάλυσή του.")
         cards = ""
         for _, r in v.head(40).iterrows():
-            cards += (f'<div class="el-bet" style="--vc:{V_COLOR[r["verdict"]]}"><div class="top"><span class="who">{esc(short(r["Παίκτης"]))} '
+            cards += (f'<div class="el-bet" style="--vc:{V_COLOR[r["verdict"]]}"><div class="top"><span class="who">{esc(short(r["Παίκτης"]))}{" ⚠️" if r.get("Νέος ρόλος") else ""} '
                       f'<span style="color:var(--muted);font-weight:400">με {esc(r["Αντίπαλος"])}</span></span>'
                       f'<span class="chip">{V_NAME[r["verdict"]]}</span></div><div class="bet">{esc(r["Στοίχημα"])}</div>'
                       f'<div class="nums"><span><i>Απόδοση</i><b>{r["Απόδοση"]:.2f}</b></span>'
@@ -728,7 +778,8 @@ def page_value(D, nxt, w_model):
         return
     show = v.assign(**{"Αναμ. κέρδος": v["EV"] * 100, "Μοντέλο": v["P μοντέλου"] * 100,
                        "Αγορά ": v["P αγοράς"].astype(float) * 100, "Πιθανότητα": v["P τελική"] * 100,
-                       "Ποντάρισμα": v["Kelly/4"] * 100, "Παίκτης": v["Παίκτης"].str.title()})
+                       "Ποντάρισμα": v["Kelly/4"] * 100,
+                       "Παίκτης": [n.title() + (" ⚠️" if r_ else "") for n, r_ in zip(v["Παίκτης"], v.get("Νέος ρόλος", [False] * len(v)))]})
     cols = ["Ετυμηγορία", "Παίκτης", "Στοίχημα", "Αντίπαλος", "Απόδοση", "Εταιρεία", "Τυπική απόδοση", "Αναμ. κέρδος", "Πιθανότητα",
             "Τελευταίοι 10", "Φόρμα", "Γιατί"]
     if detail:
@@ -877,7 +928,8 @@ def page_game(D, nxt, w_model):
         for pid in pool.index:
             out = pid in absent
             eff = M.absence_effect(pid, cur, ctx, absent)
-            r = {"Λείπει": out, "Παίκτης": pool.at[pid, "player"].title(), "Θέση": pos_name(D, pid),
+            r = {"Λείπει": out, "Παίκτης": pool.at[pid, "player"].title() + (" ⚠️" if M.role_note(pid, ctx, cur) else ""),
+                 "Θέση": pos_name(D, pid),
                  "Λεπτά": np.nan if out else eff["min"]}
             for k in show:
                 r[STAT_LABEL[k] if k != "pra" else "Π+Ρ+Α"] = np.nan if out else B.projection(pid, k, cur, ctx, nxt)[0]
@@ -889,7 +941,7 @@ def page_game(D, nxt, w_model):
             rows.append(r)
         t = pd.DataFrame(rows)
         if is_mobile():
-            t["Παίκτης"] = [short(pool.at[pid, "player"]) for pid in pool.index]
+            t["Παίκτης"] = [short(pool.at[pid, "player"]) + (" ⚠️" if M.role_note(pid, ctx, cur) else "") for pid in pool.index]
             t["Θέση"] = [pos_name(D, pid, False)[:1] for pid in pool.index]
             t = t.rename(columns={"Πόντοι": "Π", "Ριμπάουντ": "Ρ", "Ασίστ": "Α", "Π+Ρ+Α": "ΠΡΑ", "Λεπτά": "Λεπ"})[
                 ["Λείπει", "Θέση", "Παίκτης", "Λεπ", "Π", "Ρ", "Α", "ΠΡΑ"]]

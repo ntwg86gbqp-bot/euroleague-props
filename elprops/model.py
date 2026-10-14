@@ -38,6 +38,9 @@ STATS: dict[str, tuple[str, list[str]]] = {
     "stl_blk": ("Κλεψίματα+Κοψίματα", ["stl", "blk"]),
 }
 KEYS = list(STATS)
+# η διόρθωση ρόλου αφορά τη «χρήση» (σουτ, μπάλες), όχι τα ριμπάουντ/κλεψίματα/κοψίματα
+ROLE_W = np.array([{"pts": 1, "ast": 1, "fg3m": 1, "fg2m": 1, "tov": 1, "pra": 0.75, "pr": 0.7, "pa": 1}.get(k, 0.0)
+                   for k in STATS])
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,15 @@ class Params:
     kappa_max: float = 3000.0
     hl_opp: float = 15.0      # ημιζωή για τον αντίπαλο
     n0_opp: float = 6.0       # shrinkage του f_opp προς το 1
-    season_decay: float = 0.3  # επιπλέον απόσβεση στην αλλαγή σεζόν
+    season_decay: float = 0.3  # επιπλέον απόσβεση στην αλλαγή σεζόν (άμυνες αντιπάλων)
+    rate_decay: float = 0.3    # ... για τον ρυθμό ανά λεπτό του παίκτη
+    min_decay: float = 0.3     # ... για τα λεπτά του παίκτη
+    move_decay: float = 1.0    # επιπλέον πολλαπλασιαστής όταν ο παίκτης άλλαξε ομάδα (1 = καμία διαφορά)
+    role_beta: float = 0.5     # διόρθωση ρόλου: ρυθμός × (λεπτά φέτος / λεπτά πέρσι)^β
+    role_n0: float = 3.0       # ... με βάρος n/(n+n0), n = φετινοί αγώνες μέχρι τότε
+    role_clip: float = 1.2     # ... το πολύ ×1.2 ή ÷1.2 (το όριο σχεδόν δεν αλλάζει το σφάλμα· το συντηρητικό)
+    level_n0: float = 400.0    # μετατόπιση λεπτών της τρέχουσας σεζόν (π.χ. φέτος οι ομάδες μοιράζουν τα λεπτά σε
+                               # περισσότερους): μέσο σφάλμα λεπτών φέτος × n/(n+n0). 0 = χωρίς.
     min_prior: int = 5        # ελάχιστοι προηγούμενοι αγώνες για να βγει πρόβλεψη
     home: bool = True         # συντελεστής έδρας ανά αγορά
     min_recal: bool = True    # γραμμική διόρθωση των λεπτών
@@ -113,13 +124,49 @@ def load_positions(con) -> dict:
     return {pid: code[pos] for pid, pos in rows if pos in code}
 
 
-def walk_forward(df: pd.DataFrame, P: Params = Params(), positions: dict | None = None):
+def load_only_current(con) -> set:
+    """Παίκτες για τους οποίους ο χρήστης ζήτησε «μέτρα μόνο τη φετινή σεζόν»."""
+    try:
+        return {r[0] for r in con.execute("SELECT player_id FROM only_current")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def role_note(pid: str, ctx: dict, current: pd.DataFrame | None = None) -> str | None:
+    """Σύντομη περιγραφή αν ο παίκτης έχει «νέο ρόλο» φέτος (άλλη ομάδα ή ±6′ από πέρσι)."""
+    r = ctx.get("role", {}).get(pid)
+    if not r:
+        return None
+    if r.get("only_current"):
+        return "μετράει μόνο η φετινή σεζόν (δική σου επιλογή)"
+    parts = []
+    team = None if current is None or pid not in current.index else current.at[pid, "team"]
+    if r.get("prev_team") and team and r["prev_team"] != team:
+        parts.append(f"νέα ομάδα (πέρσι {r['prev_team']})")
+    pm, cm = r.get("prev_min"), r.get("cur_min")
+    if pm and cm is not None and r.get("cur_n") and abs(cm - pm) >= 6:
+        parts.append(f"{cm:.0f}′ φέτος έναντι {pm:.0f}′ πέρσι")
+        f = r.get("f_pts", 1.0)
+        if abs(f - 1) >= 0.03:
+            parts.append(f"ρυθμός σκοραρίσματος ×{f:.2f}")
+    return "νέος ρόλος: " + ", ".join(parts) if parts else None
+
+
+def walk_forward(df: pd.DataFrame, P: Params = Params(), positions: dict | None = None,
+                 only_current: set | None = None):
     """Επιστρέφει (preds, current, ctx).
 
     preds  : ένα row ανά παίκτη-αγώνα με mu_<stat> υπολογισμένο ΜΟΝΟ από προηγούμενους αγώνες
     current: κατάσταση κάθε παίκτη μετά τον τελευταίο του αγώνα (base_<stat> = r̂·m̂, ουδέτερη έδρα)
-    ctx    : {"opp": f_opp ανά ομάδα, "home": (f_εντός, f_εκτός), "min_cal": (a, b), "r0": ...}
-    """
+    ctx    : {"opp": f_opp ανά ομάδα, "home": (f_εντός, f_εκτός), "min_cal": (a, b), "r0": ...,
+              "role": {παίκτης: αλλαγή ρόλου}}
+    only_current: παίκτες για τους οποίους η προηγούμενη σεζόν αγνοείται εντελώς (επιλογή του χρήστη)
+
+    Διόρθωση ρόλου: όποιος παίζει φέτος πολύ περισσότερα λεπτά από πέρσι, συνήθως παίρνει και περισσότερα
+    σουτ/μπάλες ανά λεπτό (και το αντίθετο). Τα λεπτά τα πιάνει γρήγορα ο εκθετικός μέσος· ο ρυθμός ανά λεπτό
+    όμως έχει μεγάλη μνήμη. Γι' αυτό ο ρυθμός πολλαπλασιάζεται με (m_φέτος/m_πέρσι)^β, σταθμισμένο με το πόσους
+    φετινούς αγώνες έχουμε."""
+    only_current = only_current or set()
     prior_f, opp_now = _opp_factors(df, P)
     tot_min = df["minutes"].sum()
     r0 = df[KEYS].sum().to_numpy(float) / max(tot_min, 1.0)
@@ -132,26 +179,54 @@ def walk_forward(df: pd.DataFrame, P: Params = Params(), positions: dict | None 
         hf = np.where(r0 > 0, h[KEYS].sum().to_numpy(float) / h["minutes"].sum() / safe, 1.0)
         af = np.where(r0 > 0, a[KEYS].sum().to_numpy(float) / a["minutes"].sum() / safe, 1.0)
     lr, lm = 0.5 ** (1 / P.hl_rate), 0.5 ** (1 / P.hl_min)
-    pred_rows, cur_rows = [], []
+    pred_rows, cur_rows, roles_info = [], [], {}
     for pid, g in df.groupby("player_id", sort=False):
         X = g[KEYS].to_numpy(float)
         mins = g["minutes"].to_numpy(float)
         seasons, codes, opps = g["season"].to_numpy(), g["game_code"].to_numpy(), g["opp"].to_numpy()
         homes = g["is_home"].to_numpy()
+        teams = g["team"].to_numpy()
+        reset = pid in only_current
         Sx, Sm, Mm, Wm = np.zeros(nk), 0.0, 0.0, 0.0
+        prev_min, cur_min, cur_n = None, 0.0, 0     # μέσα λεπτά προηγούμενης σεζόν · φετινά μέχρι τώρα
+        season_min, season_n = 0.0, 0
         for t in range(len(g)):
-            if t and seasons[t] != seasons[t - 1]:
-                Sx, Sm = Sx * P.season_decay, Sm * P.season_decay
-                Mm, Wm = Mm * P.season_decay, Wm * P.season_decay
-            if t >= P.min_prior:
-                rate = (Sx + kappa * r0) / (Sm + kappa)
+            if t and (seasons[t] != seasons[t - 1] or teams[t] != teams[t - 1]):
+                new_season = seasons[t] != seasons[t - 1]
+                mv = P.move_decay if teams[t] != teams[t - 1] else 1.0
+                rd = (P.rate_decay if new_season else 1.0) * mv
+                md = (P.min_decay if new_season else 1.0) * mv
+                if new_season and reset and seasons[t] == seasons[-1]:
+                    rd = md = 0.0
+                Sx, Sm = Sx * rd, Sm * rd
+                Mm, Wm = Mm * md, Wm * md
+                if new_season:
+                    prev_min = season_min / season_n if season_n else None
+                    season_min, season_n = 0.0, 0
+            role = 1.0
+            if P.role_beta and prev_min and prev_min >= 5 and season_n and not reset:
+                ratio = max(season_min / season_n, 1.0) / prev_min
+                w = season_n / (season_n + P.role_n0)
+                role = np.clip(ratio ** (P.role_beta * w * ROLE_W), 1 / P.role_clip, P.role_clip)
+            if Wm > 0 and (t >= P.min_prior or (reset and season_n >= 1 and seasons[t] == seasons[-1])):
+                rate = (Sx + kappa * r0) / (Sm + kappa) * role
                 f = prior_f.get((seasons[t], codes[t], opps[t]), np.ones(nk))
                 pred_rows.append((g.index[t], t, Mm / Wm, *(rate * f * (hf if homes[t] else af))))
             Sx, Sm = lr * Sx + X[t], lr * Sm + mins[t]
             Mm, Wm = lm * Mm + mins[t], lm * Wm + 1.0
+            season_min, season_n = season_min + mins[t], season_n + 1
         last = g.iloc[-1]
+        role = 1.0
+        if P.role_beta and prev_min and prev_min >= 5 and season_n and not reset:
+            w = season_n / (season_n + P.role_n0)
+            role = np.clip((max(season_min / season_n, 1.0) / prev_min) ** (P.role_beta * w * ROLE_W), 1 / P.role_clip, P.role_clip)
+        roles_info[pid] = {"prev_team": teams[seasons != seasons[-1]][-1] if (seasons != seasons[-1]).any() else None,
+                           "prev_min": prev_min if seasons[-1] != seasons[0] else None,
+                           "cur_min": season_min / season_n if season_n else None, "cur_n": season_n,
+                           "factor": float(np.max(role)) if np.ndim(role) else 1.0, "f_pts": float(np.ravel(role)[0]) if np.ndim(role) else 1.0,
+                           "only_current": reset}
         cur_rows.append((pid, last["player"], last["team"], int(last["season"]), last["date"],
-                         len(g), Mm / Wm, *((Sx + kappa * r0) / (Sm + kappa))))
+                         len(g), Mm / Wm, *((Sx + kappa * r0) / (Sm + kappa) * role)))
     mu_cols = [f"mu_{k}" for k in KEYS]
     preds = pd.DataFrame(pred_rows, columns=["idx", "n_prior", "min_raw"] + mu_cols).set_index("idx")
     current = pd.DataFrame(cur_rows, columns=["player_id", "player", "team", "season", "last_date",
@@ -164,12 +239,20 @@ def walk_forward(df: pd.DataFrame, P: Params = Params(), positions: dict | None 
         b_, a_ = np.polyfit(preds["min_raw"].to_numpy(float), preds["minutes"].to_numpy(float), 1)
         b_ = float(np.clip(b_, 0.5, 1.0))
         a_ = float(preds["minutes"].mean() - b_ * preds["min_raw"].mean())
+    preds["min_hat"] = (a_ + b_ * preds["min_raw"]).clip(lower=1.0)
+    current["min_hat"] = (a_ + b_ * current["min_raw"]).clip(lower=1.0)
+    cs = int(df["season"].max())
+    lv = preds[preds["season"] == cs]
+    shift = 0.0
+    if P.level_n0 and len(lv):
+        shift = len(lv) / (len(lv) + P.level_n0) * float(lv["minutes"].mean() - lv["min_hat"].mean())
+        is_cs = current["season"] == cs
+        current.loc[is_cs, "min_hat"] = (current.loc[is_cs, "min_hat"] + shift).clip(lower=1.0)
     for d, cols in ((preds, mu_cols), (current, [f"base_{k}" for k in KEYS])):
-        d["min_hat"] = (a_ + b_ * d["min_raw"]).clip(lower=1.0)
         d[cols] = d[cols].to_numpy(float) * d["min_hat"].to_numpy(float)[:, None]
     ctx = {"opp": opp_now, "home": (hf, af), "min_cal": (a_, b_), "r0": dict(zip(KEYS, r0)),
            "roles": {**player_roles(df), **(positions or {})}, "official": set(positions or {}),
-           "team_avg": team_averages(df)}
+           "team_avg": team_averages(df), "role": roles_info, "min_shift": shift}
     ctx["def_pos"] = defense_by_position(df, ctx["roles"])
     return preds, current, ctx
 
