@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS players(
   PRIMARY KEY(player_id, season, team));
 CREATE TABLE IF NOT EXISTS absences(player_id TEXT PRIMARY KEY, set_at TEXT);
 CREATE TABLE IF NOT EXISTS only_current(player_id TEXT PRIMARY KEY, set_at TEXT);
+CREATE TABLE IF NOT EXISTS hidden_bets(player_id TEXT, stat TEXT, line REAL, side TEXT, season INTEGER, game_code INTEGER,
+  set_at TEXT, PRIMARY KEY(player_id, stat, line, side, season, game_code));
 CREATE TABLE IF NOT EXISTS bets(
   id INTEGER PRIMARY KEY AUTOINCREMENT, placed_at TEXT, player_id TEXT, player TEXT, team TEXT, opp TEXT,
   stat TEXT, line REAL, side TEXT, price REAL, stake REAL, bookmaker TEXT,

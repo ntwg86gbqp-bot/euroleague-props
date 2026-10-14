@@ -39,6 +39,33 @@ def fresh_odds(odds: pd.DataFrame, current: pd.DataFrame, con, now: pd.Timestamp
     return odds[keep.to_numpy()]
 
 
+def hidden_keys(con) -> set:
+    """Στοιχήματα που έκρυψε ο χρήστης: (παίκτης, αγορά, γραμμή, πλευρά, σεζόν, αγώνας)."""
+    try:
+        return {(r[0], r[1], float(r[2]), r[3], int(r[4]), int(r[5])) for r in
+                con.execute("SELECT player_id, stat, line, side, season, game_code FROM hidden_bets")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def bet_key(row, nxt: pd.DataFrame):
+    """Κλειδί στοιχήματος για τον επόμενο αγώνα της ομάδας του παίκτη (None αν δεν υπάρχει αγώνας)."""
+    team = row["Ομάδα"]
+    if team not in nxt.index:
+        return None
+    return (row["player_id"], row["stat"], float(row["Γραμμή"]), row["side"],
+            int(nxt.at[team, "season"]), int(nxt.at[team, "game_code"]))
+
+
+def set_hidden(con, key, hidden: bool) -> None:
+    if hidden:
+        con.execute("INSERT OR REPLACE INTO hidden_bets VALUES (?,?,?,?,?,?,?)",
+                    (*key, pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds")))
+    else:
+        con.execute("DELETE FROM hidden_bets WHERE player_id=? AND stat=? AND line=? AND side=? AND season=? AND game_code=?", key)
+    con.commit()
+
+
 def absent_ids(con) -> set:
     return {r[0] for r in con.execute("SELECT player_id FROM absences")}
 

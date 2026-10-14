@@ -169,7 +169,14 @@ def settle(con) -> int:
 
 def load(con) -> pd.DataFrame:
     ensure(con)
-    d = pd.read_sql_query("SELECT * FROM picks ORDER BY game_date DESC, id DESC", con)
+    try:
+        d = pd.read_sql_query(
+            """SELECT p.*, CASE WHEN h.player_id IS NULL THEN 0 ELSE 1 END AS hidden FROM picks p
+               LEFT JOIN hidden_bets h ON h.player_id = p.player_id AND h.stat = p.stat AND h.line = p.line
+                    AND h.side = p.side AND h.season = p.season AND h.game_code = p.game_code
+               ORDER BY p.game_date DESC, p.id DESC""", con)
+    except Exception:  # noqa: BLE001  — παλιά βάση χωρίς hidden_bets
+        d = pd.read_sql_query("SELECT *, 0 AS hidden FROM picks ORDER BY game_date DESC, id DESC", con)
     if len(d):
         for c in ("first_seen", "game_date", "settled_at"):
             d[c] = pd.to_datetime(d[c], utc=True, errors="coerce")
