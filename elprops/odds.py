@@ -19,7 +19,34 @@ MARKETS_CACHE = DATA_DIR / "oddspapi_markets.json"
 DEFAULT_BOOKS = "pinnacle,bet365,betano,stoiximan,novibet,bwin"
 
 
+# Εταιρείες όπου μπορεί να παίξει κάποιος από την Ελλάδα, όπως τις ονομάζει το OddsPapi (όσες υπάρχουν).
+# Αλλάζουν από τη σελίδα «Αποδόσεις».
+MY_BOOKS_DEFAULT: list[str] = []          # κενό = όλες οι εταιρείες (οι γραμμές συνήθως υπάρχουν και στη Stoiximan)
+SUGGESTED_BOOKS = ["betano", "betsson", "bwin", "sportingbet", "bet365", "novibet", "stoiximan"]
+
+_CON = None   # αν οριστεί (bind), οι ρυθμίσεις ζουν στη βάση, ώστε να συγχρονίζονται και στο cloud
+
+
+def bind(con) -> None:
+    """Οι ρυθμίσεις στη βάση. Την πρώτη φορά μεταφέρει ό,τι υπήρχε στο data/config.json."""
+    global _CON
+    con.execute("CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)")
+    if not con.execute("SELECT COUNT(*) FROM config").fetchone()[0] and CONFIG.exists():
+        try:
+            for k, v in json.loads(CONFIG.read_text()).items():
+                con.execute("INSERT OR REPLACE INTO config VALUES (?, ?)", (k, json.dumps(v)))
+        except Exception:  # noqa: BLE001
+            pass
+    con.commit()
+    _CON = con
+
+
 def load_config() -> dict:
+    if _CON is not None:
+        try:
+            return {k: json.loads(v) for k, v in _CON.execute("SELECT key, value FROM config")}
+        except Exception:  # noqa: BLE001
+            return {}
     try:
         return json.loads(CONFIG.read_text())
     except Exception:  # noqa: BLE001
@@ -27,8 +54,22 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    if _CON is not None:
+        old = load_config()
+        for k, v in cfg.items():
+            if old.get(k) != v:
+                _CON.execute("INSERT OR REPLACE INTO config VALUES (?, ?)", (k, json.dumps(v)))
+        for k in set(old) - set(cfg):
+            _CON.execute("DELETE FROM config WHERE key=?", (k,))
+        _CON.commit()
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+def my_books(cfg: dict | None = None) -> list[str]:
+    cfg = load_config() if cfg is None else cfg
+    return list(cfg.get("my_books", MY_BOOKS_DEFAULT))
 
 
 # ---------- ονόματα ----------
@@ -206,7 +247,11 @@ def fetch_oddspapi(key: str, bookmakers: str = DEFAULT_BOOKS, days: int = 7,
 # ---------- αποθήκευση ----------
 
 def store(con, rows: list[dict], index: PlayerIndex, source: str) -> tuple[int, list[str]]:
-    """Γράφει ένα νέο στιγμιότυπο. Επιστρέφει (πλήθος, ονόματα που δεν ταίριαξαν)."""
+    """Γράφει ένα νέο στιγμιότυπο. Επιστρέφει (πλήθος, ονόματα που δεν ταίριαξαν).
+
+    Κρατάει μόνο την τελευταία τιμή: οι παλιότερες εγγραφές του ίδιου στοιχήματος σβήνονται (το ιστορικό τιμών
+    δεν χρησιμοποιείται πουθενά· η κίνηση της αγοράς κρατιέται στο Αρχείο). Για το API, ένα νέο στιγμιότυπο
+    αντικαθιστά ολόκληρο το προηγούμενο των ίδιων παικτών, ώστε να φεύγουν και οι γραμμές που αποσύρθηκαν."""
     ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     unmatched, n = set(), 0
     for r in rows:
@@ -219,6 +264,17 @@ def store(con, rows: list[dict], index: PlayerIndex, source: str) -> tuple[int, 
                     (ts, source, r.get("bookmaker") or "—", r["player_raw"], pid, r["stat"],
                      float(r["line"]), r["side"], float(r["price"])))
         n += 1
+    if n:
+        con.execute("""DELETE FROM odds WHERE fetched_at < ? AND EXISTS (
+                         SELECT 1 FROM odds o2 WHERE o2.fetched_at = ? AND o2.player_id = odds.player_id
+                           AND o2.stat = odds.stat AND o2.line = odds.line AND o2.side = odds.side
+                           AND o2.bookmaker = odds.bookmaker)""", (ts, ts))
+        if source == "oddspapi":
+            con.execute("""DELETE FROM odds WHERE source = 'oddspapi' AND fetched_at < ?
+                             AND player_id IN (SELECT DISTINCT player_id FROM odds WHERE fetched_at = ? AND source = 'oddspapi')""",
+                        (ts, ts))
+    cut = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).isoformat(timespec="seconds")
+    con.execute("DELETE FROM odds WHERE fetched_at < ?", (cut,))      # πολύ παλιές: δεν χρησιμεύουν
     con.commit()
     return n, sorted(unmatched)
 

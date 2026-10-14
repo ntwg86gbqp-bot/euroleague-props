@@ -54,8 +54,15 @@ CLOSE = 1.0
 LOW_MIN = 0.6
 
 
+NEW_COLS = {"price_med": "REAL", "ev_med": "REAL", "n_books": "INTEGER"}
+
+
 def ensure(con) -> None:
     con.executescript(SCHEMA)
+    have = {r[1] for r in con.execute("PRAGMA table_info(picks)")}
+    for c, t in NEW_COLS.items():
+        if c not in have:
+            con.execute(f"ALTER TABLE picks ADD COLUMN {c} {t}")
 
 
 def _now() -> str:
@@ -84,18 +91,21 @@ def record(con, board: pd.DataFrame, nxt: pd.DataFrame, current: pd.DataFrame, w
                           "AND season=? AND game_code=?", key).fetchone()
         vals = dict(price=float(r["Απόδοση"]), bookmaker=r.get("Εταιρεία"), p_model=_f(r.get("P μοντέλου")),
                     p_market=_f(r.get("P αγοράς")), p_final=_f(r.get("P τελική")), ev=_f(r.get("EV")),
-                    verdict=r["verdict"], mu=_f(r.get("Πρόβλεψη")), min_hat=_f(r.get("Λεπτά")), w_model=float(w_model))
+                    verdict=r["verdict"], mu=_f(r.get("Πρόβλεψη")), min_hat=_f(r.get("Λεπτά")), w_model=float(w_model),
+                    price_med=_f(r.get("Τυπική απόδοση")), ev_med=_f(r.get("EV τυπικής")),
+                    n_books=int(r.get("Εταιρείες αγοράς") or 0))
         if row is None:
             if r["verdict"] not in RECORD:
                 continue
             con.execute(
                 "INSERT INTO picks(first_seen, last_seen, player_id, player, team, opp, stat, line, side, price, bookmaker,"
                 " p_model, p_market, p_final, ev, verdict, mu, min_hat, w_model, price_last, ev_last, verdict_last,"
-                " season, game_code, game_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " season, game_code, game_date, price_med, ev_med, n_books)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, ts, r["player_id"], r["Παίκτης"], team, r["Αντίπαλος"], r["stat"], key[2], r["side"],
                  vals["price"], vals["bookmaker"], vals["p_model"], vals["p_market"], vals["p_final"], vals["ev"],
                  vals["verdict"], vals["mu"], vals["min_hat"], vals["w_model"], vals["price"], vals["ev"], vals["verdict"],
-                 key[4], key[5], gdate.isoformat()))
+                 key[4], key[5], gdate.isoformat(), vals["price_med"], vals["ev_med"], vals["n_books"]))
             new += 1
             continue
         pid_, old_verdict, status = row
@@ -103,9 +113,10 @@ def record(con, board: pd.DataFrame, nxt: pd.DataFrame, current: pd.DataFrame, w
             continue
         if RANK.get(r["verdict"], 0) > RANK.get(old_verdict, 0):
             con.execute("UPDATE picks SET first_seen=?, price=?, bookmaker=?, p_model=?, p_market=?, p_final=?, ev=?,"
-                        " verdict=?, mu=?, min_hat=?, w_model=? WHERE id=?",
+                        " verdict=?, mu=?, min_hat=?, w_model=?, price_med=?, ev_med=?, n_books=? WHERE id=?",
                         (ts, vals["price"], vals["bookmaker"], vals["p_model"], vals["p_market"], vals["p_final"],
-                         vals["ev"], vals["verdict"], vals["mu"], vals["min_hat"], vals["w_model"], pid_))
+                         vals["ev"], vals["verdict"], vals["mu"], vals["min_hat"], vals["w_model"],
+                         vals["price_med"], vals["ev_med"], vals["n_books"], pid_))
         con.execute("UPDATE picks SET last_seen=?, price_last=?, ev_last=?, verdict_last=? WHERE id=?",
                     (ts, vals["price"], vals["ev"], r["verdict"], pid_))
     con.commit()
@@ -162,26 +173,48 @@ def load(con) -> pd.DataFrame:
     if len(d):
         for c in ("first_seen", "game_date", "settled_at"):
             d[c] = pd.to_datetime(d[c], utc=True, errors="coerce")
-        d["units"] = np.select([d["status"] == "won", d["status"] == "lost"], [d["price"] - 1, -1.0], 0.0)
+        # τυπική απόδοση: ο διάμεσος των εταιρειών. Για παλιές εγγραφές (πριν μπει) εκτίμηση από την αγορά
+        # με 6% γκανιότα, όσο περίπου έχει μια μεγάλη εταιρεία στα ειδικά παικτών.
+        est = 1 / (d["p_market"] * 1.06)
+        d["typ_approx"] = d["price_med"].isna()
+        d["price_typ"] = d["price_med"].fillna(est.where(d["p_market"] > 0)).fillna(d["price"])
+        d["price_typ"] = np.minimum(d["price_typ"], d["price"])
+        won, lost = d["status"] == "won", d["status"] == "lost"
+        d["units"] = np.select([won, lost], [d["price_typ"] - 1, -1.0], 0.0)         # στην τυπική απόδοση
+        d["units_best"] = np.select([won, lost], [d["price"] - 1, -1.0], 0.0)        # στην καλύτερη
+        d["exp_market"] = np.where(d["p_market"].notna(), d["p_market"], 1 / d["price_typ"])
         # κίνηση αγοράς: >0 σημαίνει ότι η απόδοση έπεσε μετά την καταγραφή (η αγορά ήρθε προς το μέρος μας)
         d["clv"] = d["price"] / d["price_last"] - 1
     return d
 
 
 def summary(d: pd.DataFrame) -> dict:
-    """Σύνοψη ανά 1 μονάδα ποντάρισμα, με περιθώριο τύχης για την απόδοση επένδυσης."""
+    """Σύνοψη ανά 1 μονάδα. Το περιθώριο τύχης λογαριάζει ότι τα στοιχήματα του ίδιου αγώνα κινούνται μαζί
+    (ένας αγώνας με χαμηλό σκορ κάνει πολλά Under να βγουν μαζί): διακύμανση από τα αθροίσματα ανά αγώνα."""
     s = d[d["status"].isin(["won", "lost"])]
     n = len(s)
     out = {"n": n, "n_open": int((d["status"] == "open").sum()), "n_void": int(d["status"].isin(["void", "push"]).sum())}
     if not n:
         return out
-    p = s["p_final"].fillna(1 / s["price"])
-    var = (p * (1 - p) * s["price"] ** 2).sum()           # διασπορά κέρδους ανά στοίχημα του 1
+    win = (s["status"] == "won").astype(float)
+    p_mod = s["p_model"].fillna(s["p_final"])
+    p_mkt = s["exp_market"]
+
+    def band(x: pd.Series) -> float:
+        """90% περιθώριο για τον μέσο όρο του x, με συσταδοποίηση ανά αγώνα."""
+        g = (x - x.mean()).groupby([s["season"], s["game_code"]]).sum()
+        return float(1.64 * np.sqrt((g ** 2).sum()) / n) if len(g) > 1 else float("nan")
+    games = s.groupby(["season", "game_code"]).ngroups
     moved = d[d["status"] != "void"].dropna(subset=["clv"])
     moved = moved[moved["price_last"] != moved["price"]]
-    out.update(units=float(s["units"].sum()), roi=float(s["units"].mean()), hit=float((s["status"] == "won").mean()),
-               exp_hit=float(p.mean()), exp_units=float(s["ev"].fillna(0).sum()), exp_roi=float(s["ev"].fillna(0).mean()),
-               roi_band=float(1.64 * np.sqrt(var) / n), avg_price=float(s["price"].mean()),
-               n_moved=len(moved), clv=float(moved["clv"].mean()) if len(moved) else None,
-               clv_pos=float((moved["clv"] > 0).mean()) if len(moved) else None)
+    out.update(
+        hit=float(win.mean()), exp_model=float(p_mod.mean()), exp_market=float(p_mkt.mean()),
+        hit_band=band(win - p_mkt), games=games,
+        units=float(s["units"].sum()), roi=float(s["units"].mean()), roi_band=band(s["units"]),
+        units_best=float(s["units_best"].sum()), roi_best=float(s["units_best"].mean()),
+        avg_price=float(s["price_typ"].mean()), avg_best=float(s["price"].mean()),
+        approx=float(s["typ_approx"].mean()),
+        exp_units=float(s["ev"].fillna(0).sum()),
+        n_moved=len(moved), clv=float(moved["clv"].mean()) if len(moved) else None,
+        clv_pos=float((moved["clv"] > 0).mean()) if len(moved) else None)
     return out

@@ -315,11 +315,12 @@ def _dist(mu, k):
 def probs(mu, k, line):
     """(P(over), P(push), P(under)). Over κερδίζει όταν X > line."""
     line = np.asarray(line, float)
-    d = _dist(mu, k)
+    mu = np.maximum(np.asarray(mu, float), 1e-9)
+    k = np.asarray(k, float)
+    pr = k / (k + mu)
     fl = np.floor(line)
-    p_over = d.sf(fl)                       # P(X >= floor(line)+1)
-    p_push = np.where(line == fl, d.pmf(fl), 0.0)
-    p_over = np.asarray(p_over, float)
+    p_over = np.asarray(sps.nbinom.sf(fl, k, pr), float)        # P(X >= floor(line)+1)
+    p_push = np.where(line == fl, sps.nbinom.pmf(fl, k, pr), 0.0)
     return p_over, p_push, 1.0 - p_over - p_push
 
 

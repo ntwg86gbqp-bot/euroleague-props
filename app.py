@@ -345,6 +345,7 @@ def get_con():
 
 
 con, SYNC, BOOT = get_con()
+O.bind(con)                     # ρυθμίσεις (κλειδί OddsPapi, εταιρείες) στη βάση, ώστε να σώζονται και στο cloud
 if SYNC:
     SYNC.maybe_push()
 
@@ -397,12 +398,13 @@ def live_odds(D):
 def board_for(D, nxt, w_model):
     """(αποδόσεις, πίνακας αξίας), υπολογισμένα μία φορά ανά αλλαγή δεδομένων/αποδόσεων/ρυθμίσεων."""
     odds = live_odds(D)
-    key = (data_sig(), con.execute("SELECT COALESCE(MAX(id), 0) FROM odds").fetchone()[0], round(float(w_model), 3),
+    books = O.my_books()
+    key = (tuple(books), data_sig(), con.execute("SELECT COALESCE(MAX(id), 0) FROM odds").fetchone()[0], round(float(w_model), 3),
            tuple(sorted(D["ctx"].get("absent", set()))), tuple(nxt["game_code"].astype(str)) if len(nxt) else (), len(odds))
     hit = st.session_state.get("_board")
     if hit and hit[0] == key:
         return hit[1], hit[2]
-    b = B.build(odds, D["df"], D["current"], D["ctx"], D["disp"], nxt, w_model) if not odds.empty else pd.DataFrame()
+    b = B.build(odds, D["df"], D["current"], D["ctx"], D["disp"], nxt, w_model, books=books) if not odds.empty else pd.DataFrame()
     st.session_state["_board"] = (key, odds, b)
     return odds, b
 
@@ -669,7 +671,7 @@ def page_value(D, nxt, w_model):
                 f'<div class="who">{esc(r["Παίκτης"].title())}, {esc(r["Ομάδα"])} με {esc(r["Αντίπαλος"])}</div>'
                 f'<div class="bet">{esc(r["Στοίχημα"])}</div>'
                 f'<div class="row"><div><div class="l">Απόδοση</div><div class="v">{r["Απόδοση"]:.2f}</div></div>'
-                f'<div><div class="l">Αναμ. κέρδος</div><div class="v" style="color:{V_COLOR[r["verdict"]]}">{r["EV"]:+.1%}</div></div>'
+                f'<div><div class="l">Τυπική · κέρδος</div><div class="v" style="color:{V_COLOR[r["verdict"]]}">{r["Τυπική απόδοση"]:.2f} · {r["EV τυπικής"]:+.0%}</div></div>'
                 f'<div><div class="l">Πιθανότητα</div><div class="v">{pct(r["P τελική"])}</div></div></div>'
                 f'<div class="why">{esc(r["Γιατί"])}</div></div>', unsafe_allow_html=True)
         st.write("")
@@ -727,10 +729,10 @@ def page_value(D, nxt, w_model):
     show = v.assign(**{"Αναμ. κέρδος": v["EV"] * 100, "Μοντέλο": v["P μοντέλου"] * 100,
                        "Αγορά ": v["P αγοράς"].astype(float) * 100, "Πιθανότητα": v["P τελική"] * 100,
                        "Ποντάρισμα": v["Kelly/4"] * 100, "Παίκτης": v["Παίκτης"].str.title()})
-    cols = ["Ετυμηγορία", "Παίκτης", "Στοίχημα", "Αντίπαλος", "Απόδοση", "Αναμ. κέρδος", "Πιθανότητα",
+    cols = ["Ετυμηγορία", "Παίκτης", "Στοίχημα", "Αντίπαλος", "Απόδοση", "Εταιρεία", "Τυπική απόδοση", "Αναμ. κέρδος", "Πιθανότητα",
             "Τελευταίοι 10", "Φόρμα", "Γιατί"]
     if detail:
-        cols = cols[:-1] + ["Μοντέλο", "Αγορά ", "Πρόβλεψη", "Λεπτά", "Σεζόν", "Ποντάρισμα", "Εταιρεία", "Γιατί"]
+        cols = cols[:-1] + ["Μοντέλο", "Αγορά ", "Πρόβλεψη", "Λεπτά", "Σεζόν", "Ποντάρισμα", "Εταιρείες αγοράς", "Γιατί"]
     heading(st, "Όλα τα στοιχήματα", "Κλικ στο κουτάκι αριστερά από μια γραμμή για να ανοίξει η ανάλυση του παίκτη από κάτω. "
             "Άφησε το ποντίκι πάνω στον τίτλο μιας στήλης για να δεις τι σημαίνει.")
     ev = st.dataframe(
@@ -743,12 +745,17 @@ def page_value(D, nxt, w_model):
                                                         help=GLOSS["Πιθανότητα"] + f" Εδώ: {w_model:.0%} μοντέλο και {1 - w_model:.0%} αγορά."),
             "Μοντέλο": st.column_config.NumberColumn(format="%.0f%%", help=GLOSS["Πιθανότητα μοντέλου"]),
             "Αγορά ": st.column_config.NumberColumn(format="%.0f%%", help=GLOSS["Πιθανότητα αγοράς"]),
-            "Απόδοση": st.column_config.NumberColumn(format="%.2f", help=GLOSS["Απόδοση"]),
+            "Απόδοση": st.column_config.NumberColumn("Καλύτερη", format="%.2f", help=GLOSS["Απόδοση"] + " Η καλύτερη από όλες τις εταιρείες."),
+            "Τυπική απόδοση": st.column_config.NumberColumn("Τυπική", format="%.2f",
+                                                            help="Ο διάμεσος όλων των εταιρειών: περίπου όσο βρίσκεις στη Stoiximan. "
+                                                                 "Αν η Stoiximan δίνει κάτω από αυτό, το αναμενόμενο κέρδος είναι μικρότερο."),
+            "Εταιρείες αγοράς": st.column_config.NumberColumn(help="Από πόσες εταιρείες βγήκε η γνώμη της αγοράς."),
             "Πρόβλεψη": st.column_config.NumberColumn(format="%.1f", help=GLOSS["Πρόβλεψη"]),
             "Λεπτά": st.column_config.NumberColumn(format="%.0f", help=GLOSS["Αναμενόμενα λεπτά"]),
             "Αντίπαλος": st.column_config.TextColumn(help="Η ομάδα που αντιμετωπίζει στον επόμενο αγώνα."),
             "Παίκτης": st.column_config.TextColumn(help="Επώνυμο, όνομα."),
             "Εταιρεία": st.column_config.TextColumn(help="Η εταιρεία με την καλύτερη απόδοση για αυτό το στοίχημα."),
+            "Αναμ. κέρδος ": st.column_config.NumberColumn(format="%+.1f%%"),
             "Τελευταίοι 10": st.column_config.BarChartColumn(y_min=0, help=GLOSS["Τελευταίοι 10"]),
             "Φόρμα": st.column_config.TextColumn(help=GLOSS["Φόρμα"]),
             "Σεζόν": st.column_config.TextColumn(help="Πόσες φορές θα κέρδιζε φέτος"),
@@ -1034,7 +1041,7 @@ def refresh_odds(D) -> str:
     """Τραβάει αποδόσεις από το OddsPapi με το αποθηκευμένο κλειδί. Επιστρέφει μήνυμα."""
     cfg = O.load_config()
     try:
-        res = O.fetch_oddspapi(cfg["oddspapi_key"], cfg.get("books", O.DEFAULT_BOOKS), 7)
+        res = O.fetch_oddspapi(cfg["oddspapi_key"], cfg.get("books", ""), 7)
         n, unmatched = O.store(con, res["rows"], O.PlayerIndex(D["current"]), "oddspapi")
     except Exception as e:  # noqa: BLE001
         return f"Οι αποδόσεις δεν ανανεώθηκαν: {e}"
@@ -1179,9 +1186,23 @@ def page_odds(D):
                 st.success(f"Αποθηκεύτηκαν {n} τιμές. Άλλαξε αγορά ή αγώνα για να συνεχίσεις.")
 
     with t_api:
-        st.caption("Χρειάζεται δωρεάν κλειδί από το oddspapi.io. Το κλειδί αποθηκεύεται μόνο τοπικά (data/config.json).")
+        st.caption("Χρειάζεται δωρεάν κλειδί από το oddspapi.io. Το κλειδί αποθηκεύεται μαζί με τα δεδομένα σου "
+                   "και από εκεί και πέρα οι αποδόσεις ανανεώνονται μόνες τους (κάθε 6 ώρες, όταν ανοίγεις τη σελίδα «Αξία»).")
         key = st.text_input("API key", value=cfg.get("oddspapi_key", ""), type="password")
-        books = st.text_input("Εταιρείες (slugs, με κόμμα· κενό = όλες)", value=cfg.get("books", O.DEFAULT_BOOKS))
+        seen = sorted({b for b in O.latest(con).query("source == 'oddspapi'")["bookmaker"].unique()} if not O.latest(con).empty else set())
+        mine = O.my_books(cfg)
+        opts = list(dict.fromkeys(mine + O.SUGGESTED_BOOKS + seen))
+        new_mine = st.multiselect(
+            "Εταιρείες που παίζω (κενό = όλες)", opts, default=mine, key="my_books_sel", placeholder="Όλες",
+            format_func=lambda b: b + ("" if not seen or b in seen else " (δεν έρχεται από το API)"),
+            help="Μόνο οι αποδόσεις αυτών μετράνε για «Αξίζει» και για το Αρχείο. Οι υπόλοιπες εταιρείες χρησιμοποιούνται "
+                 "μόνο για να βγει η γνώμη της αγοράς. Ό,τι περνάς εσύ (screenshot, χειροκίνητα) μετράει πάντα.")
+        if new_mine != mine and st.button("Αποθήκευση εταιρειών"):
+            O.save_config({**cfg, "my_books": new_mine})
+            st.session_state.pop("_board", None)
+            st.rerun()
+        books = st.text_input("Από ποιες εταιρείες να φέρνει (slugs, με κόμμα· κενό = όλες)", value=cfg.get("books", ""),
+                              help="Καλύτερα κενό: όσο περισσότερες εταιρείες, τόσο πιο αξιόπιστη η γνώμη της αγοράς.")
         days = st.slider("Ημέρες μπροστά", 1, 10, 7)
         if st.button("Λήψη αποδόσεων", type="primary", disabled=not key):
             O.save_config({**cfg, "oddspapi_key": key, "books": books})
@@ -1322,6 +1343,7 @@ def page_data(D):
         try:
             CL.restore_into(con, up_.getvalue())
             _schema(con)
+            O.bind(con)
             con.commit()
             st.session_state.pop("_board", None)
             if SYNC:
@@ -1818,31 +1840,48 @@ def page_archive(D):
         return
     sm = PK.summary(v)
     if sm["n"]:
-        col_u = V_COLOR["strong"] if sm["units"] > 0 else V_COLOR["suspect"] if sm["units"] < 0 else None
-        clv_txt = "—" if sm["clv"] is None else f'{sm["clv"]:+.1%}'
+        GOODC, BADC = V_COLOR["strong"], V_COLOR["suspect"]
+        edge = sm["hit"] - sm["exp_market"]
+        col_h = GOODC if edge > 0.005 else BADC if edge < -0.005 else None
+        col_u = GOODC if sm["units"] > 0 else BADC if sm["units"] < 0 else None
+        heading(st, "Έκβαση", f'{sm["n"]} κλεισμένα σε {sm["games"]} αγώνες · ανοιχτά {sm["n_open"]} · ακυρωμένα {sm["n_void"]}. '
+                "Η έκβαση δεν εξαρτάται από την εταιρεία: μετράει μόνο αν βγήκε το στοίχημα.")
         tiles(st, [
-            ("Κλεισμένα", str(sm["n"]), f'Ανοιχτά {sm["n_open"]} · ακυρωμένα {sm["n_void"]}.'),
-            ("Επιτυχία", pct(sm["hit"]), f'Το μοντέλο περίμενε {pct(sm["exp_hit"])}. Μέση απόδοση {sm["avg_price"]:.2f}.'),
-            ("Κέρδος", f'{sm["units"]:+.1f}<small>μον.</small>', f'Με 1 μονάδα σε καθένα. Αναμενόταν {sm["exp_units"]:+.1f}.', col_u),
-            ("Απόδοση επένδυσης", f'{sm["roi"]:+.1%}', f'Περιθώριο τύχης ±{sm["roi_band"]:.0%}. Αναμενόταν {sm["exp_roi"]:+.1%}.', col_u),
-            ("Κίνηση αγοράς", clv_txt,
-             "Καμία αλλαγή απόδοσης ακόμα: πέρνα αποδόσεις και λίγο πριν τον αγώνα." if sm["clv"] is None else
-             f'Σε {sm["n_moved"]} που άλλαξαν, το {pct(sm["clv_pos"])} κινήθηκε υπέρ μας.',
-             None if sm["clv"] is None else (V_COLOR["strong"] if sm["clv"] > 0 else V_COLOR["suspect"])),
+            ("Βγήκαν", pct(sm["hit"]), f'{int(round(sm["hit"] * sm["n"]))} από {sm["n"]}.', col_h),
+            ("Περίμενε η αγορά", pct(sm["exp_market"]), "Η πιθανότητα από τις αποδόσεις, χωρίς γκανιότα. Αυτό πρέπει να ξεπερνάμε."),
+            ("Περίμενε το μοντέλο", pct(sm["exp_model"]), "Αν τα «Βγήκαν» είναι κοντά εδώ, οι πιθανότητες του μοντέλου είναι σωστές."),
+            ("Πάνω από την αγορά", f'{edge * 100:+.1f}<small>μον.</small>',
+             f'Περιθώριο τύχης ±{sm["hit_band"] * 100:.0f} μονάδες (λογαριάζει ότι στοιχήματα του ίδιου αγώνα κινούνται μαζί).', col_h),
         ])
-        lo, hi = sm["roi"] - sm["roi_band"], sm["roi"] + sm["roi_band"]
-        if sm["n"] < 30:
-            vc, t, msg = GREY, "Πολύ νωρίς", (f'Με {sm["n"]} κλεισμένα, η τύχη μόνη της μετακινεί την απόδοση επένδυσης κατά '
-                                              f'±{sm["roi_band"]:.0%}. Ό,τι βλέπεις είναι θόρυβος. Μετράει περισσότερο η κίνηση της αγοράς.')
+        heading(st, "Κέρδος με 1 μονάδα σε κάθε στοίχημα", "Στην <b>τυπική απόδοση</b>: ο διάμεσος όλων των εταιρειών, "
+                "περίπου όσο βρίσκεις σε μια μεγάλη εταιρεία όπως η Stoiximan. Η καλύτερη απόδοση της αγοράς δίνεται για σύγκριση."
+                + (f' Για {sm["approx"]:.0%} των στοιχημάτων (παλιές καταγραφές) η τυπική απόδοση είναι εκτίμηση από την αγορά.'
+                   if sm["approx"] > 0 else ""))
+        tiles(st, [
+            ("Κέρδος (τυπική απόδοση)", f'{sm["units"]:+.1f}<small>μον.</small>', f'Μέση τυπική απόδοση {sm["avg_price"]:.2f}.', col_u),
+            ("Απόδοση επένδυσης", f'{sm["roi"]:+.1%}', f'Περιθώριο τύχης ±{sm["roi_band"]:.0%}.', col_u),
+            ("Στην καλύτερη απόδοση", f'{sm["units_best"]:+.1f}<small>μον.</small>',
+             f'{sm["roi_best"]:+.1%} με μέση απόδοση {sm["avg_best"]:.2f}. Μόνο αν έπαιζες κάθε φορά στην πιο γενναιόδωρη εταιρεία.'),
+            ("Κίνηση αγοράς", "—" if sm["clv"] is None else f'{sm["clv"]:+.1%}',
+             "Καμία αλλαγή απόδοσης ακόμα." if sm["clv"] is None else f'Σε {sm["n_moved"]} που άλλαξαν, το {pct(sm["clv_pos"])} κινήθηκε υπέρ μας.',
+             None if sm["clv"] is None else (GOODC if sm["clv"] > 0 else BADC)),
+        ])
+        lo, hi = edge - sm["hit_band"], edge + sm["hit_band"]
+        if sm["games"] < 15:
+            vc, t, msg = GREY, "Πολύ νωρίς", (f'Μόνο {sm["games"]} αγώνες. Τα στοιχήματα του ίδιου αγώνα κερδίζουν και χάνουν μαζί, '
+                                              f'οπότε το πραγματικό δείγμα είναι μικρό: η έκβαση μπορεί να απέχει ±{sm["hit_band"] * 100:.0f} '
+                                              'μονάδες από την αγορά μόνο από τύχη. Χρειάζονται τουλάχιστον 3–4 αγωνιστικές.')
         elif lo > 0:
-            vc, t, msg = V_COLOR["strong"], "Κερδίζει πέρα από την τύχη", (f'Το κέρδος {sm["roi"]:+.1%} είναι έξω από το περιθώριο τύχης '
-                                                                            f'(±{sm["roi_band"]:.0%}). Καλό σημάδι, αλλά συνέχισε να μετράς.')
+            vc, t, msg = GOODC, "Το μοντέλο βλέπει κάτι που η αγορά δεν βλέπει", (
+                f'Τα στοιχήματα βγαίνουν {edge * 100:+.1f} μονάδες πιο συχνά από όσο λένε οι αποδόσεις, πέρα από το περιθώριο τύχης. '
+                'Συνέχισε να μετράς: μια κακή εβδομάδα μπορεί να το αλλάξει.')
         elif hi < 0:
-            vc, t, msg = V_COLOR["suspect"], "Χάνει πέρα από την τύχη", (f'Η ζημιά {sm["roi"]:+.1%} δεν εξηγείται από τύχη (±{sm["roi_band"]:.0%}). '
-                                                                         'Το μοντέλο υπερεκτιμά κάπου: δες τον πίνακα ανά αγορά παρακάτω.')
+            vc, t, msg = BADC, "Η αγορά ξέρει καλύτερα", (
+                f'Τα στοιχήματα βγαίνουν {edge * 100:+.1f} μονάδες λιγότερο από όσο λένε οι αποδόσεις. Το μοντέλο υπερεκτιμά κάπου: '
+                'δες τον πίνακα ανά αγορά παρακάτω.')
         else:
-            vc, t, msg = V_COLOR["marginal"], "Ακόμα μέσα στην τύχη", (f'Το {sm["roi"]:+.1%} είναι μέσα στο περιθώριο ±{sm["roi_band"]:.0%}: '
-                                                                       'ούτε απόδειξη πλεονεκτήματος, ούτε απόδειξη ότι δεν υπάρχει.')
+            vc, t, msg = V_COLOR["marginal"], "Ακόμα μέσα στην τύχη", (
+                f'Η διαφορά από την αγορά ({edge * 100:+.1f} μονάδες) είναι μέσα στο περιθώριο ±{sm["hit_band"] * 100:.0f}.')
         st.markdown(f'<div class="el-verdict" style="--vc:{vc}"><div class="t"><b>{t}</b></div><div class="s">{esc(msg)}</div></div>',
                     unsafe_allow_html=True)
     else:
@@ -1855,7 +1894,8 @@ def page_archive(D):
         if len(s) >= 2:
             s["n"] = np.arange(1, len(s) + 1)
             long = pd.concat([pd.DataFrame({"n": s["n"], "u": s["units"].cumsum(), "Σειρά": "Πραγματικό"}),
-                              pd.DataFrame({"n": s["n"], "u": s["ev"].fillna(0).cumsum(), "Σειρά": "Αναμενόμενο"})])
+                              pd.DataFrame({"n": s["n"], "u": (s["p_final"].fillna(s["exp_market"]) * s["price_typ"] - 1).cumsum(),
+                                            "Σειρά": "Αναμενόμενο"})])
             ch = alt.Chart(long).mark_line(strokeWidth=2).encode(
                 x=alt.X("n:Q", title="Κλεισμένα με τη σειρά του αγώνα", axis=alt.Axis(tickMinStep=1)),
                 y=alt.Y("u:Q", title="Μονάδες"),
@@ -1863,7 +1903,7 @@ def page_archive(D):
                 strokeDash=alt.StrokeDash("Σειρά:N", scale=alt.Scale(domain=["Πραγματικό", "Αναμενόμενο"], range=[[1, 0], [5, 4]]), legend=None),
                 tooltip=["Σειρά", alt.Tooltip("n:Q", title="Στοίχημα"), alt.Tooltip("u:Q", format="+.2f", title="Μονάδες")])
             zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=HAIR).encode(y="y:Q")
-            heading(a, "Πορεία σε μονάδες", sw(BLUE, "πραγματικό", "ln") + sw(MUTED, "αναμενόμενο από το μοντέλο", "ln dash")
+            heading(a, "Πορεία σε μονάδες (τυπική απόδοση)", sw(BLUE, "πραγματικό", "ln") + sw(MUTED, "αναμενόμενο από το μοντέλο", "ln dash")
                     + "<br>Η μπλε θα ανεβοκατεβαίνει γύρω από τη διακεκομμένη. Αν μένει σταθερά από κάτω, το μοντέλο είναι αισιόδοξο.")
             show_chart(a, (zero + ch).properties(height=280))
         if len(closed):
@@ -1883,11 +1923,11 @@ def page_archive(D):
 
     if len(s) >= 5:
         by = s.groupby("stat").agg(n=("id", "size"), hit=("status", lambda x: (x == "won").mean()),
-                                   exp=("p_final", "mean"), u=("units", "sum"), roi=("units", "mean"),
+                                   exp=("exp_market", "mean"), u=("units", "sum"), roi=("units", "mean"),
                                    eroi=("ev", "mean")).reset_index()
         by["Αγορά"] = by["stat"].map(STAT_LABEL)
         sd = s.groupby("side").agg(n=("id", "size"), hit=("status", lambda x: (x == "won").mean()),
-                                   exp=("p_final", "mean"), u=("units", "sum"), roi=("units", "mean"),
+                                   exp=("exp_market", "mean"), u=("units", "sum"), roi=("units", "mean"),
                                    eroi=("ev", "mean")).reset_index()
         sd["Αγορά"] = sd["side"].str.title() + " (όλες)"
         T = pd.concat([by, sd], ignore_index=True)
@@ -1897,10 +1937,10 @@ def page_archive(D):
         st.dataframe(T[["Αγορά", "n", "hit", "u"] if mob else ["Αγορά", "n", "hit", "exp", "u", "roi", "eroi"]], hide_index=True, width="stretch", column_config={
             "n": st.column_config.NumberColumn("Κλεισμένα"),
             "hit": st.column_config.NumberColumn("Επιτυχία", format="%.0f%%"),
-            "exp": st.column_config.NumberColumn("Αναμενόταν", format="%.0f%%"),
+            "exp": st.column_config.NumberColumn("Περίμενε η αγορά", format="%.0f%%"),
             "u": st.column_config.NumberColumn("Μονάδες", format="%+.1f", help=GLOSS["Μονάδα"]),
             "roi": st.column_config.NumberColumn("Απόδ. επένδυσης", format="%+.1f%%", help=GLOSS["Απόδοση επένδυσης"]),
-            "eroi": st.column_config.NumberColumn("Αναμενόταν ", format="%+.1f%%")})
+            "eroi": st.column_config.NumberColumn("Αναμ. κέρδος (μοντέλο)", format="%+.1f%%")})
 
     heading(st, "Όλες οι καταγραφές", "Η απόδοση είναι αυτή τη στιγμή της καταγραφής. Η «τελευταία» είναι η πιο πρόσφατη "
             "που είδαμε πριν τον αγώνα. Το αποτέλεσμα και ο χαρακτηρισμός συμπληρώνονται μόνα τους.")
@@ -1918,22 +1958,24 @@ def page_archive(D):
             cards += (f'<div class="el-bet" style="--vc:{col_}"><div class="top"><span class="who">{esc(r["Παίκτης"])} '
                       f'<span style="color:var(--muted);font-weight:400">{esc(r["Αγώνας"])} · με {esc(r["opp"])}</span></span>'
                       f'<span class="chip" style="color:{V_COLOR.get(r["verdict"], MUTED)}">{esc(r["Ετυμηγορία"])}</span></div><div class="bet">{esc(r["Στοίχημα"])}</div>'
-                      f'<div class="nums"><span><i>Απόδοση</i><b>{r["price"]:.2f}</b></span>'
+                      f'<div class="nums"><span><i>Τυπική απόδοση</i><b>{r["price_typ"]:.2f}</b></span>'
                       f'<span><i>Αναμ. κέρδος</i><b>{r["ev_pct"]:+.1f}%</b></span><span><i>Μονάδες</i><b>{u_}</b></span></div>'
                       f'<div class="why">{esc(r["Έκβαση"])}</div></div>')
         st.markdown(cards, unsafe_allow_html=True)
     else:
-        st.dataframe(w[["Αγώνας", "Παίκτης", "opp", "Στοίχημα", "Ετυμηγορία", "price", "price_last", "clv_pct", "ev_pct",
-                        "mu", "Έκβαση", "units"]],
+        st.dataframe(w[["Αγώνας", "Παίκτης", "opp", "Στοίχημα", "Ετυμηγορία", "price_typ", "price", "bookmaker", "price_last",
+                        "clv_pct", "ev_pct", "mu", "Έκβαση", "units"]],
                      hide_index=True, width="stretch", height=min(38 * (len(w) + 1) + 2, 640), column_config={
                          "opp": st.column_config.TextColumn("Αντίπαλος"),
-                         "price": st.column_config.NumberColumn("Απόδοση", format="%.2f", help="Η απόδοση τη στιγμή της καταγραφής."),
+                         "price_typ": st.column_config.NumberColumn("Τυπική", format="%.2f", help="Ο διάμεσος όλων των εταιρειών: περίπου όσο βρίσκεις στη Stoiximan."),
+                         "price": st.column_config.NumberColumn("Καλύτερη", format="%.2f", help="Η καλύτερη απόδοση της αγοράς τη στιγμή της καταγραφής."),
+                         "bookmaker": st.column_config.TextColumn("Εταιρεία", help="Πού ήταν η καλύτερη απόδοση."),
                          "price_last": st.column_config.NumberColumn("Τελευταία", format="%.2f", help="Η τελευταία απόδοση πριν τον αγώνα."),
                          "clv_pct": st.column_config.NumberColumn("Κίνηση αγοράς", format="%+.1f%%", help=GLOSS["Κίνηση αγοράς"]),
                          "ev_pct": st.column_config.NumberColumn("Αναμ. κέρδος", format="%+.1f%%", help=GLOSS["Αναμενόμενο κέρδος"]),
                          "mu": st.column_config.NumberColumn("Πρόβλεψη", format="%.1f", help=GLOSS["Πρόβλεψη"]),
                          "Έκβαση": st.column_config.TextColumn(width="large", help="Αποτέλεσμα, τι έκανε ο παίκτης, και χαρακτηρισμός."),
-                         "units": st.column_config.NumberColumn("Μονάδες", format="%+.2f", help=GLOSS["Μονάδα"]),
+                         "units": st.column_config.NumberColumn("Μονάδες", format="%+.2f", help=GLOSS["Μονάδα"] + " Στην τυπική απόδοση."),
                      })
     with st.expander("Υπόμνημα"):
         st.markdown('<dl class="el-gloss">' + "".join(
