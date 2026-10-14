@@ -12,6 +12,28 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import importlib
+import sys
+
+# Στο Streamlit Cloud, μετά από νέα έκδοση ξανατρέχει μόνο το app.py: τα modules του elprops μένουν στη μνήμη
+# όπως ήταν. Αν άλλαξε κάποιο αρχείο τους από την τελευταία φόρτωση, τα ξαναφορτώνουμε (με σειρά εξαρτήσεων).
+_EL_MODS = ["db", "model", "picks", "bets", "board", "odds", "euroleague", "cloud", "defense", "shot"]
+
+
+def _reload_changed():
+    stamps = getattr(sys, "_elprops_stamps", None)
+    here = os.path.dirname(os.path.abspath(__file__))
+    now = {m: os.path.getmtime(os.path.join(here, "elprops", m + ".py")) for m in _EL_MODS
+           if os.path.exists(os.path.join(here, "elprops", m + ".py"))}
+    if stamps is not None and stamps != now:
+        for m in _EL_MODS:
+            mod = sys.modules.get("elprops." + m)
+            if mod is not None:
+                importlib.reload(mod)
+    sys._elprops_stamps = now
+
+
+_reload_changed()
 from elprops import bets as BT, board as B, cloud as CL, db, euroleague as E, model as M, odds as O, picks as PK, shot as SH
 
 import html as _html
