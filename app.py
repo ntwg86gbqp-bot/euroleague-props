@@ -762,12 +762,10 @@ def page_value(D, nxt, w_model):
         st.info("Κανένα από τα στοιχήματα που πέρασες δεν έχει αξία σύμφωνα με το μοντέλο. Αυτό είναι το συνηθισμένο.")
 
     with st.expander("Φίλτρα"):
-        f = st.columns([2, 2, 1, 1, 1])
-        poss = f[4].multiselect("Θέσεις", [0, 1, 2], format_func=M.ROLE_NAMES.get, placeholder="Όλες")
+        f = st.columns([3, 1, 1])
         stats = f[0].multiselect("Αγορές", M.KEYS, format_func=STAT_LABEL.get, placeholder="Όλες")
-        teams = f[1].multiselect("Ομάδες", sorted(b["Ομάδα"].unique()), placeholder="Όλες")
-        side = f[2].selectbox("Πλευρά", ["Όλες", "Over", "Under"])
-        min_g = f[3].number_input("Ελάχιστοι αγώνες ιστορικού", value=8, step=1, min_value=0)
+        side = f[1].selectbox("Πλευρά", ["Όλες", "Over", "Under"])
+        min_g = f[2].number_input("Ελάχιστοι αγώνες ιστορικού", value=8, step=1, min_value=0)
     t1, t2, t3, t4 = st.columns(4)
     t4.toggle(f"Δείξε τα κρυμμένα ({len(hidden_rows)})", key="show_hidden",
               help="Στοιχήματα που έκρυψες εσύ. Μένουν κρυμμένα μόνο για τον επόμενο αγώνα του παίκτη.")
@@ -782,12 +780,12 @@ def page_value(D, nxt, w_model):
         v = v[~v["Νέος ρόλος"]]
     if stats:
         v = v[v["stat"].isin(stats)]
-    if poss:
-        v = v[[pos_of(D, p_) in poss for p_ in v["player_id"]]]
-    if teams:
-        v = v[v["Ομάδα"].isin(teams)]
     if side != "Όλες":
         v = v[v["Πλευρά"] == side]
+    v = v.assign(_game=[game_label(nxt.at[t, "date"], t, o) if t in nxt.index else "—"
+                        for t, o in zip(v["Ομάδα"], v["Αντίπαλος"])])
+    v = study_filters(v, D, "vf", price="Τυπική απόδοση", prob="P τελική", ev="EV", team="Ομάδα", opp="Αντίπαλος",
+                      game="_game", pid="player_id", minutes="Λεπτά", player="Παίκτης")
     v = v.reset_index(drop=True)
     if v.empty:
         st.caption("Τίποτα να δείξω με αυτά τα φίλτρα.")
@@ -897,6 +895,89 @@ def hidden_list(rows: pd.DataFrame):
             if c2.button("Επαναφορά", key=f"unhide_{i}"):
                 B.set_hidden(con, r["_key"], False)
                 st.rerun()
+
+
+def _fold(x) -> str:
+    """Πεζά, χωρίς τόνους: για αναζήτηση ονομάτων."""
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", str(x)) if not unicodedata.combining(c)).lower()
+
+
+def game_label(date, a, b) -> str:
+    d = pd.Timestamp(date)
+    d = d.tz_convert("Europe/Athens") if d.tzinfo else d
+    x, y = sorted([str(a), str(b)])
+    return f"{d:%d/%m} {x}–{y}"
+
+
+def study_filters(df: pd.DataFrame, D, key: str, *, price=None, prob=None, ev=None, team=None, opp=None,
+                  game=None, pid=None, minutes=None, player=None, expanded=False) -> pd.DataFrame:
+    """Κοινά φίλτρα μελέτης. Κάθε όρισμα είναι το όνομα της στήλης στο df (ή None αν δεν υπάρχει).
+    Τα εύρη που μένουν στην πλήρη έκτασή τους δεν φιλτράρουν τίποτα (ούτε τις κενές τιμές)."""
+    if df.empty:
+        return df
+    out = df
+    mob = is_mobile()
+    n_on = 0
+    with st.expander("Φίλτρα μελέτης", expanded=expanded):
+        c = st.columns(1 if mob else 3)
+        col = lambda i: c[0] if mob else c[i % 3]  # noqa: E731
+
+        def rng(i, label, colname, lo, hi, step, fmt, scale=1.0, help_=None):
+            nonlocal out, n_on
+            vals = df[colname].astype(float) * scale
+            if vals.notna().sum() == 0:
+                return
+            lo_, hi_ = float(np.floor(min(lo, vals.min()) / step) * step), float(np.ceil(max(hi, vals.max()) / step) * step)
+            if hi_ <= lo_:
+                return
+            a, b = col(i).slider(label, lo_, hi_, (lo_, hi_), step, format=fmt, key=f"{key}_{colname}", help=help_)
+            if a > lo_ or b < hi_:
+                x = out[colname].astype(float) * scale
+                out = out[(x >= a - 1e-9) & (x <= b + 1e-9)]
+                n_on += 1
+        i = 0
+        if price:
+            rng(i, "Απόδοση", price, 1.0, 3.0, 0.05, "%.2f",
+                help_="Η τυπική απόδοση (διάμεσος των εταιρειών) όπου υπάρχει, αλλιώς η απόδοση της γραμμής."); i += 1
+        if prob:
+            rng(i, "Πιθανότητα (%)", prob, 0, 100, 1.0, "%.0f%%", 100.0, GLOSS["Πιθανότητα"]); i += 1
+        if ev:
+            rng(i, "Αναμενόμενο κέρδος (%)", ev, 0, 10, 1.0, "%+.0f%%", 100.0, GLOSS["Αναμενόμενο κέρδος"]); i += 1
+        if minutes:
+            rng(i, "Αναμενόμενα λεπτά", minutes, 0, 40, 1.0, "%.0f′", 1.0, GLOSS["Αναμενόμενα λεπτά"]); i += 1
+        if pid:
+            ps = col(i).multiselect("Θέση", [0, 1, 2], format_func=M.ROLE_NAMES.get, placeholder="Όλες", key=f"{key}_pos")
+            if ps:
+                out = out[[pos_of(D, p_) in ps for p_ in out[pid]]]
+                n_on += 1
+            i += 1
+        for lab, colname in (("Ομάδα", team), ("Αντίπαλος", opp)):
+            if colname:
+                opts = sorted(df[colname].dropna().astype(str).unique(), key=team_short)
+                sel = col(i).multiselect(lab, opts, format_func=lambda t: f"{team_short(t)} ({t})", placeholder="Όλες",
+                                         key=f"{key}_{colname}")
+                if sel:
+                    out = out[out[colname].astype(str).isin(sel)]
+                    n_on += 1
+                i += 1
+        if game:
+            opts = sorted(df[game].dropna().unique())
+            sel = col(i).multiselect("Αγώνας", opts, placeholder="Όλοι", key=f"{key}_game")
+            if sel:
+                out = out[out[game].isin(sel)]
+                n_on += 1
+            i += 1
+        if player:
+            q = col(i).text_input("Παίκτης", key=f"{key}_q", placeholder="π.χ. Sloukas")
+            if q.strip():
+                qq = _fold(q.strip())
+                out = out[[qq in _fold(n) for n in out[player]]]
+                n_on += 1
+        if n_on:
+            st.caption(f"{n_on} ενεργά φίλτρα · {len(out)} από {len(df)}.")
+    return out
+
 
 
 def page_player(D, nxt, w_model):
@@ -1399,6 +1480,24 @@ def page_odds(D):
     if len(lat):
         lat = lat.assign(Παίκτης=lat["player_id"].map(cur["player"]), Αγορά=lat["stat"].map(STAT_LABEL),
                          Ώρα=lat["fetched_at"].dt.tz_convert("Europe/Athens").dt.strftime("%d/%m %H:%M"))
+        nxt_ = B.next_games(con)
+        lat["Ομάδα"] = lat["player_id"].map(cur["team"])
+        lat["Αντίπαλος"] = lat["Ομάδα"].map(nxt_["opp"]) if len(nxt_) else None
+        lat["_game"] = [game_label(nxt_.at[t, "date"], t, o) if isinstance(t, str) and t in nxt_.index else "—"
+                        for t, o in zip(lat["Ομάδα"], lat["Αντίπαλος"])]
+        lat["_min"] = lat["player_id"].map(cur["min_hat"])
+        # πιθανότητα και κέρδος του μοντέλου στη συγκεκριμένη τιμή (από τον πίνακα αξίας, όπου υπάρχει)
+        _, bb_ = board_for(D, nxt_, 0.5)
+        if len(bb_):
+            pw = bb_.set_index(["player_id", "stat", "Γραμμή", "side"])["P τελική"]
+            pw = pw[~pw.index.duplicated()]
+            lat["_p"] = [pw.get((p_, s_, float(l_), sd_), np.nan) for p_, s_, l_, sd_ in
+                         zip(lat["player_id"], lat["stat"], lat["line"], lat["side"])]
+            lat["_ev"] = lat["_p"] * lat["price"] - 1
+        else:
+            lat["_p"] = lat["_ev"] = np.nan
+        lat = study_filters(lat, D, "of", price="price", prob="_p", ev="_ev", team="Ομάδα", opp="Αντίπαλος",
+                            game="_game", pid="player_id", minutes="_min", player="Παίκτης")
         if is_mobile():
             m_ = pd.DataFrame({"Παίκτης": [short(n) for n in lat["Παίκτης"].fillna("—")],
                                "Στοίχημα": [f"{'O' if sd == 'over' else 'U'} {ln:g} {STAT_LABEL.get(stt, stt)}"
@@ -1408,9 +1507,13 @@ def page_odds(D):
                 "Παίκτης": st.column_config.TextColumn(width=110), "Απόδ.": st.column_config.NumberColumn(format="%.2f", width=56),
                 "Στοίχημα": st.column_config.TextColumn(help="O = Over, U = Under")})
         else:
-            st.dataframe(lat[["Παίκτης", "Αγορά", "line", "side", "price", "bookmaker", "source", "Ώρα"]].rename(
+            st.dataframe(lat[["Παίκτης", "Ομάδα", "Αντίπαλος", "Αγορά", "line", "side", "price", "_p", "_ev", "bookmaker", "source", "Ώρα"]].rename(
                 columns={"line": "Γραμμή", "side": "Πλευρά", "price": "Απόδοση", "bookmaker": "Εταιρεία",
-                         "source": "Πηγή"}), hide_index=True, width="stretch")
+                         "source": "Πηγή"}).assign(_p=lambda x: x["_p"] * 100, _ev=lambda x: x["_ev"] * 100),
+                hide_index=True, width="stretch", column_config={
+                    "_p": st.column_config.NumberColumn("Πιθανότητα", format="%.0f%%", help=GLOSS["Πιθανότητα"]),
+                    "_ev": st.column_config.NumberColumn("Αναμ. κέρδος", format="%+.1f%%",
+                                                         help=GLOSS["Αναμενόμενο κέρδος"] + " Σε αυτή την τιμή.")})
         if st.button("Διαγραφή όλων των αποδόσεων"):
             con.execute("DELETE FROM odds")
             con.commit()
@@ -1999,6 +2102,9 @@ def page_archive(D, embedded: bool = False):
         v = v[v["stat"].isin(stats)]
     if side:
         v = v[v["side"] == side]
+    v = v.assign(_game=[game_label(gd, t, o) for gd, t, o in zip(v["game_date"], v["team"], v["opp"])])
+    v = study_filters(v, D, "af", price="price_typ", prob="p_final", ev="ev", team="team", opp="opp",
+                      game="_game", pid="player_id", minutes="min_hat", player="player")
     v_all = v                                  # χωρίς το φίλτρο ετικετών, για τη σύγκριση ανά ετικέτα
     v = with_tags(v, tag_f)
     if v.empty:
