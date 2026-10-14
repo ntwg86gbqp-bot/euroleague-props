@@ -1946,7 +1946,29 @@ def page_archive(D, embedded: bool = False):
             format_func={"all": "Όλα", "visible": "Χωρίς τα κρυμμένα", "hidden": "Μόνο τα κρυμμένα"}.get,
             help="Τα στοιχήματα που έκρυψες στη σελίδα «Αξία». Αν τα κρυμμένα βγαίνουν λιγότερο από τα υπόλοιπα, "
                  "οι απορρίψεις σου βοηθούν.") or "all"
+    tags_all = PK.all_tags(con)
+    tg = PK.load_tags(con, d)
+    n_exc = int(d["excluded"].sum())
+    g1, g2, g3 = st.columns([3, 2, 2])
+    tag_f = g1.multiselect("Ετικέτες", tags_all + ["— χωρίς ετικέτα"], key="arc_tags", placeholder="Όλα τα στοιχήματα",
+                           help="Δείχνει όσα έχουν τουλάχιστον μία από τις ετικέτες. Τις βάζεις στον πίνακα στο τέλος της σελίδας.")
+    only_before = g2.toggle("Μόνο σημειωμένα πριν τον αγώνα", True, key="arc_before",
+                            help="Μετράει μια ετικέτα μόνο αν τη έβαλες πριν το τζάμπολ, δηλαδή χωρίς να ξέρεις το αποτέλεσμα. "
+                                 "Αυτό είναι το τίμιο ποσοστό.")
+    view = g3.segmented_control(f"Εξαιρέσεις ({n_exc})", ["all", "exc"], default="all", key="arc_view",
+                                format_func={"all": "Χωρίς αυτές", "exc": "Μόνο αυτές"}.get,
+                                help="Όσα εξαίρεσες (στήλη ✕ του πίνακα) δεν μετράνε πουθενά, εκτός αν δεις «Μόνο αυτές».") or "all"
     v = d[d["verdict"].isin(vs)]
+    v = v[v["excluded"] == (1 if view == "exc" else 0)]
+    tg_ok = tg[tg["before"]] if only_before else tg
+
+    def with_tags(x: pd.DataFrame, chosen) -> pd.DataFrame:
+        if not chosen:
+            return x
+        ids = set(tg_ok.loc[tg_ok["tag"].isin(chosen), "pick_id"])
+        if "— χωρίς ετικέτα" in chosen:
+            ids |= set(x["id"]) - set(tg["pick_id"])
+        return x[x["id"].isin(ids)]
     if hid_mode == "visible":
         v = v[v["hidden"] == 0]
     elif hid_mode == "hidden":
@@ -1955,6 +1977,8 @@ def page_archive(D, embedded: bool = False):
         v = v[v["stat"].isin(stats)]
     if side:
         v = v[v["side"] == side]
+    v_all = v                                  # χωρίς το φίλτρο ετικετών, για τη σύγκριση ανά ετικέτα
+    v = with_tags(v, tag_f)
     if v.empty:
         st.caption("Τίποτα με αυτά τα φίλτρα.")
         return
@@ -2007,6 +2031,33 @@ def page_archive(D, embedded: bool = False):
     else:
         st.caption(f'{sm["n_open"]} ανοιχτά, κανένα κλεισμένο ακόμα. Κλείνουν μόνα τους μετά τον αγώνα, με την ενημέρωση στατιστικών.')
 
+    after = v[(v["tag_after"] & (not only_before)) | ((v["excluded"] == 1) & ~v["excluded_before"])]
+    after = after[after["status"] != "open"]
+    if len(after):
+        st.markdown(f'<div class="el-leg" style="color:{WARN}">⚠️ {len(after)} από αυτά τα σημείωσες ή τα εξαίρεσες <b>μετά</b> τον αγώνα. '
+                    'Εκ των υστέρων επιλογές κάνουν το ποσοστό να φαίνεται καλύτερο απ\' ό,τι είναι.</div>', unsafe_allow_html=True)
+    cl_all = v_all[v_all["status"].isin(["won", "lost"])]
+    if len(tg) and len(cl_all):
+        def line_(x, lab):
+            r_ = {"Ομάδα": lab, "Κλεισμένα": len(x)}
+            if len(x):
+                r_.update({"Βγήκαν": 100 * (x["status"] == "won").mean(), "Περίμενε η αγορά": 100 * x["exp_market"].mean(),
+                           "Μονάδες": x["units"].sum(), "Απόδ. επένδυσης": 100 * x["units"].mean()})
+            return r_
+        rows_ = [line_(cl_all, "Όλα (με τα τωρινά φίλτρα)")]
+        for t_ in tags_all:
+            pre = cl_all[cl_all["id"].isin(tg.loc[(tg["tag"] == t_) & tg["before"], "pick_id"])]
+            post = cl_all[cl_all["id"].isin(tg.loc[(tg["tag"] == t_) & ~tg["before"], "pick_id"])]
+            if len(pre) or len(post):
+                rows_.append(line_(pre, f"🏷️ {t_} · πριν τον αγώνα"))
+            if len(post):
+                rows_.append(line_(post, f"🏷️ {t_} · μετά (εκ των υστέρων)"))
+        rows_.append(line_(cl_all[~cl_all["id"].isin(tg["pick_id"])], "Χωρίς ετικέτα"))
+        heading(st, "Ανά ετικέτα", "Με τα ίδια φίλτρα (ετυμηγορία, αγορά, πλευρά). Μετράει η γραμμή «πριν τον αγώνα»: τότε δεν ήξερες "
+                "το αποτέλεσμα. Αν μια ετικέτα βγαίνει σταθερά πάνω από τα «Όλα», η κρίση σου προσθέτει αξία.")
+        st.dataframe(pd.DataFrame(rows_), hide_index=True, width="stretch", column_config={
+            "Βγήκαν": st.column_config.NumberColumn(format="%.0f%%"), "Περίμενε η αγορά": st.column_config.NumberColumn(format="%.0f%%"),
+            "Μονάδες": st.column_config.NumberColumn(format="%+.1f"), "Απόδ. επένδυσης": st.column_config.NumberColumn(format="%+.1f%%")})
     if n_hid and hid_mode == "all":
         cl = v[v["status"].isin(["won", "lost"])]
         hh, vv = cl[cl["hidden"] == 1], cl[cl["hidden"] == 0]
@@ -2081,33 +2132,53 @@ def page_archive(D, embedded: bool = False):
         Ετυμηγορία=v["verdict"].map(V_NAME),
         Έκβαση=[("🙈 " if r.get("hidden") else "") + outcome_text(r) for r in v.to_dict("records")],
         ev_pct=v["ev"] * 100, clv_pct=v["clv"] * 100)
+    w = w.assign(Ετικέτες=w["tags"], Εξαίρεση=w["excluded"].astype(bool)).reset_index(drop=True)
+    flag_cfg = {"Ετικέτες": st.column_config.MultiselectColumn(
+                    "🏷️" if mob else "Ετικέτες", options=tags_all, accept_new_options=True, width=110 if mob else "medium",
+                    help="Διάλεξε ή γράψε νέα ετικέτα (π.χ. «Σίγουρα», «Ρίσκο»). Ένα στοίχημα μπορεί να έχει πολλές. "
+                         "Καλύτερα πριν τον αγώνα: μετά μετράει ως «εκ των υστέρων»."),
+                "Εξαίρεση": st.column_config.CheckboxColumn("✕" if mob else "Εξαίρεση", width=34 if mob else "small",
+                                                            help="Βγαίνει από τα ποσοστά (π.χ. ο παίκτης τραυματίστηκε στο 2ο λεπτό). "
+                                                                 "Φαίνεται μόνο στο «Μόνο οι εξαιρέσεις».")}
     if mob:
-        cards = ""
-        for r in w.head(60).to_dict("records"):
-            col_ = TAG_COLOR.get(r["tag"], BLUE) if r["status"] != "open" else HAIR
-            u_ = f'{r["units"]:+.2f}' if r["status"] != "open" else "—"
-            cards += (f'<div class="el-bet" style="--vc:{col_}"><div class="top"><span class="who">{esc(r["Παίκτης"])} '
-                      f'<span style="color:var(--muted);font-weight:400">{esc(r["Αγώνας"])} · με {esc(r["opp"])}</span></span>'
-                      f'<span class="chip" style="color:{V_COLOR.get(r["verdict"], MUTED)}">{esc(r["Ετυμηγορία"])}</span></div><div class="bet">{esc(r["Στοίχημα"])}</div>'
-                      f'<div class="nums"><span><i>Τυπική απόδοση</i><b>{r["price_typ"]:.2f}</b></span>'
-                      f'<span><i>Αναμ. κέρδος</i><b>{r["ev_pct"]:+.1f}%</b></span><span><i>Μονάδες</i><b>{u_}</b></span></div>'
-                      f'<div class="why">{esc(r["Έκβαση"])}</div></div>')
-        st.markdown(cards, unsafe_allow_html=True)
+        w["Στ."] = [f"{'O' if sd_ == 'over' else 'U'} {ln:g} {STAT_LABEL.get(stt, stt)} @{pt:.2f}"
+                    for sd_, ln, stt, pt in zip(w["side"], w["line"], w["stat"], w["price_typ"])]
+        w["Αποτ."] = [outcome_text(r).split(" ")[0] + (f' {r["result"]:.0f}' if r["status"] in ("won", "lost", "push") else "")
+                      for r in w.to_dict("records")]
+        cols_w = ["Ετικέτες", "Εξαίρεση", "Παίκτης", "Στ.", "Αποτ."]
+        cfg = {**flag_cfg, "Παίκτης": st.column_config.TextColumn(width=86), "Στ.": st.column_config.TextColumn(width=140),
+               "Αποτ.": st.column_config.TextColumn(width=52)}
     else:
-        st.dataframe(w[["Αγώνας", "Παίκτης", "opp", "Στοίχημα", "Ετυμηγορία", "price_typ", "price", "bookmaker", "price_last",
-                        "clv_pct", "ev_pct", "mu", "Έκβαση", "units"]],
-                     hide_index=True, width="stretch", height=min(38 * (len(w) + 1) + 2, 640), column_config={
-                         "opp": st.column_config.TextColumn("Αντίπαλος"),
-                         "price_typ": st.column_config.NumberColumn("Τυπική", format="%.2f", help="Ο διάμεσος όλων των εταιρειών: περίπου όσο βρίσκεις στη Stoiximan."),
-                         "price": st.column_config.NumberColumn("Καλύτερη", format="%.2f", help="Η καλύτερη απόδοση της αγοράς τη στιγμή της καταγραφής."),
-                         "bookmaker": st.column_config.TextColumn("Εταιρεία", help="Πού ήταν η καλύτερη απόδοση."),
-                         "price_last": st.column_config.NumberColumn("Τελευταία", format="%.2f", help="Η τελευταία απόδοση πριν τον αγώνα."),
-                         "clv_pct": st.column_config.NumberColumn("Κίνηση αγοράς", format="%+.1f%%", help=GLOSS["Κίνηση αγοράς"]),
-                         "ev_pct": st.column_config.NumberColumn("Αναμ. κέρδος", format="%+.1f%%", help=GLOSS["Αναμενόμενο κέρδος"]),
-                         "mu": st.column_config.NumberColumn("Πρόβλεψη", format="%.1f", help=GLOSS["Πρόβλεψη"]),
-                         "Έκβαση": st.column_config.TextColumn(width="large", help="Αποτέλεσμα, τι έκανε ο παίκτης, και χαρακτηρισμός."),
-                         "units": st.column_config.NumberColumn("Μονάδες", format="%+.2f", help=GLOSS["Μονάδα"] + " Στην τυπική απόδοση."),
-                     })
+        cols_w = ["Ετικέτες", "Εξαίρεση", "Αγώνας", "Παίκτης", "opp", "Στοίχημα", "Ετυμηγορία", "price_typ", "price", "bookmaker",
+                  "price_last", "clv_pct", "ev_pct", "mu", "Έκβαση", "units"]
+        cfg = {**flag_cfg,
+               "opp": st.column_config.TextColumn("Αντίπαλος"),
+               "price_typ": st.column_config.NumberColumn("Τυπική", format="%.2f", help="Ο διάμεσος όλων των εταιρειών: περίπου όσο βρίσκεις στη Stoiximan."),
+               "price": st.column_config.NumberColumn("Καλύτερη", format="%.2f", help="Η καλύτερη απόδοση της αγοράς τη στιγμή της καταγραφής."),
+               "bookmaker": st.column_config.TextColumn("Εταιρεία", help="Πού ήταν η καλύτερη απόδοση."),
+               "price_last": st.column_config.NumberColumn("Τελευταία", format="%.2f", help="Η τελευταία απόδοση πριν τον αγώνα."),
+               "clv_pct": st.column_config.NumberColumn("Κίνηση αγοράς", format="%+.1f%%", help=GLOSS["Κίνηση αγοράς"]),
+               "ev_pct": st.column_config.NumberColumn("Αναμ. κέρδος", format="%+.1f%%", help=GLOSS["Αναμενόμενο κέρδος"]),
+               "mu": st.column_config.NumberColumn("Πρόβλεψη", format="%.1f", help=GLOSS["Πρόβλεψη"]),
+               "Έκβαση": st.column_config.TextColumn(width="large", help="Αποτέλεσμα, τι έκανε ο παίκτης, και χαρακτηρισμός."),
+               "units": st.column_config.NumberColumn("Μονάδες", format="%+.2f", help=GLOSS["Μονάδα"] + " Στην τυπική απόδοση."),
+               }
+    ed = st.data_editor(w[cols_w], hide_index=True, width="stretch", key=f"arc_ed_{view}_{hid_mode}",
+                        height=min(38 * (len(w) + 1) + 2, 640), column_config=cfg,
+                        disabled=[c for c in cols_w if c not in ("Ετικέτες", "Εξαίρεση")])
+    norm = lambda x: sorted(set(x or []))  # noqa: E731
+    ch_fav = w.loc[[norm(a_) != norm(b_) for a_, b_ in zip(ed["Ετικέτες"], w["Ετικέτες"])]]
+    ch_exc = w.loc[ed["Εξαίρεση"].to_numpy() != w["Εξαίρεση"].to_numpy()]
+    if len(ch_fav) or len(ch_exc):
+        n_after = int(((ch_fav["status"] != "open").sum()) + ((ch_exc["status"] != "open").sum()))
+        if st.button(f"Αποθήκευση ({len(ch_fav) + len(ch_exc)} αλλαγές)", type="primary", key="arc_save"):
+            for i, new_ in zip(ch_fav["id"], ed.loc[ch_fav.index, "Ετικέτες"]):
+                PK.set_tags(con, i, list(new_ or []))
+            for i, new_ in zip(ch_exc["id"], ed.loc[ch_exc.index, "Εξαίρεση"]):
+                PK.set_flag(con, [i], "excluded", bool(new_))
+            st.rerun()
+        if n_after:
+            st.caption(f"⚠️ {n_after} από τις αλλαγές αφορούν αγώνες που έχουν ήδη παιχτεί: θα μετρήσουν ως «εκ των υστέρων».")
     with st.expander("Υπόμνημα"):
         st.markdown('<dl class="el-gloss">' + "".join(
             f'<dt style="color:{TAG_COLOR[k]}">{TAG_ICON[k]} {esc(PK.TAGS[k])}</dt><dd>{esc(PK.TAG_MEANS[k])}</dd>' for k in PK.TAGS)

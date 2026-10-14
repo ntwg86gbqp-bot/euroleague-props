@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS picks(
   season INTEGER, game_code INTEGER, game_date TEXT,
   status TEXT DEFAULT 'open', result REAL, minutes REAL, tag TEXT, settled_at TEXT,
   UNIQUE(player_id, stat, line, side, season, game_code));
+CREATE TABLE IF NOT EXISTS pick_tags(pick_id INTEGER, tag TEXT, set_at TEXT, PRIMARY KEY(pick_id, tag));
 """
+DEFAULT_TAGS = ["Θα τα έπαιζα"]
 
 # χαρακτηρισμοί έκβασης
 TAGS = {
@@ -54,7 +56,9 @@ CLOSE = 1.0
 LOW_MIN = 0.6
 
 
-NEW_COLS = {"price_med": "REAL", "ev_med": "REAL", "n_books": "INTEGER"}
+NEW_COLS = {"price_med": "REAL", "ev_med": "REAL", "n_books": "INTEGER",
+            "fav": "INTEGER DEFAULT 0", "fav_at": "TEXT",          # «θα το έπαιζα» και πότε σημειώθηκε
+            "excluded": "INTEGER DEFAULT 0", "excluded_at": "TEXT"}  # εξαίρεση από τα ποσοστά και πότε
 
 
 def ensure(con) -> None:
@@ -63,6 +67,10 @@ def ensure(con) -> None:
     for c, t in NEW_COLS.items():
         if c not in have:
             con.execute(f"ALTER TABLE picks ADD COLUMN {c} {t}")
+    # παλιό «θα το έπαιζα» -> ετικέτα, με την ίδια ώρα σήμανσης
+    con.execute("""INSERT OR IGNORE INTO pick_tags(pick_id, tag, set_at)
+                   SELECT id, ?, fav_at FROM picks WHERE fav = 1""", (DEFAULT_TAGS[0],))
+    con.execute("UPDATE picks SET fav = 0 WHERE fav = 1")
 
 
 def _now() -> str:
@@ -167,6 +175,42 @@ def settle(con) -> int:
     return n
 
 
+def set_flag(con, ids, field: str, value: bool) -> None:
+    """field: 'fav' ή 'excluded'. Κρατάει πότε έγινε η σήμανση, για να ξεχωρίζει «πριν» από «μετά» τον αγώνα."""
+    assert field in ("fav", "excluded")
+    ts = _now() if value else None
+    con.executemany(f"UPDATE picks SET {field}=?, {field}_at=? WHERE id=?", [(int(value), ts, int(i)) for i in ids])
+    con.commit()
+
+
+def set_tags(con, pick_id: int, tags) -> None:
+    """Ορίζει τις ετικέτες ενός στοιχήματος. Όσες υπήρχαν κρατούν την αρχική ώρα σήμανσης."""
+    tags = {t.strip() for t in (tags or []) if t and t.strip()}
+    old = {r[0] for r in con.execute("SELECT tag FROM pick_tags WHERE pick_id=?", (int(pick_id),))}
+    for t in old - tags:
+        con.execute("DELETE FROM pick_tags WHERE pick_id=? AND tag=?", (int(pick_id), t))
+    for t in tags - old:
+        con.execute("INSERT INTO pick_tags VALUES (?,?,?)", (int(pick_id), t, _now()))
+    con.commit()
+
+
+def all_tags(con) -> list[str]:
+    ensure(con)
+    used = [r[0] for r in con.execute("SELECT tag FROM pick_tags GROUP BY tag ORDER BY MIN(set_at)")]
+    return list(dict.fromkeys(DEFAULT_TAGS + used))
+
+
+def load_tags(con, d: pd.DataFrame) -> pd.DataFrame:
+    """Ένα row ανά (στοίχημα, ετικέτα) με before = σημειώθηκε πριν το τζάμπολ."""
+    t = pd.read_sql_query("SELECT * FROM pick_tags", con)
+    if t.empty or d.empty:
+        return pd.DataFrame(columns=["pick_id", "tag", "set_at", "before"])
+    t["set_at"] = pd.to_datetime(t["set_at"], utc=True, errors="coerce")
+    t = t.merge(d[["id", "game_date"]], left_on="pick_id", right_on="id", how="inner")
+    t["before"] = t["set_at"].notna() & (t["set_at"] < t["game_date"])
+    return t[["pick_id", "tag", "set_at", "before"]]
+
+
 def load(con) -> pd.DataFrame:
     ensure(con)
     try:
@@ -190,6 +234,16 @@ def load(con) -> pd.DataFrame:
         d["units"] = np.select([won, lost], [d["price_typ"] - 1, -1.0], 0.0)         # στην τυπική απόδοση
         d["units_best"] = np.select([won, lost], [d["price"] - 1, -1.0], 0.0)        # στην καλύτερη
         d["exp_market"] = np.where(d["p_market"].notna(), d["p_market"], 1 / d["price_typ"])
+        tg = load_tags(con, d)
+        lists = tg.groupby("pick_id")["tag"].agg(list) if len(tg) else pd.Series(dtype=object)
+        d["tags"] = [list(lists.get(i, [])) for i in d["id"]]
+        after = set(tg.loc[~tg["before"], "pick_id"]) if len(tg) else set()
+        d["tag_after"] = d["id"].isin(after)
+        for f in ("fav", "excluded"):
+            d[f] = d[f].fillna(0).astype(int)
+            at = pd.to_datetime(d[f + "_at"], utc=True, errors="coerce")
+            # «πριν»: σημειώθηκε πριν το τζάμπολ, άρα χωρίς να ξέρεις το αποτέλεσμα
+            d[f + "_before"] = (d[f] == 1) & at.notna() & (at < d["game_date"])
         # κίνηση αγοράς: >0 σημαίνει ότι η απόδοση έπεσε μετά την καταγραφή (η αγορά ήρθε προς το μέρος μας)
         d["clv"] = d["price"] / d["price_last"] - 1
     return d
