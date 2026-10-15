@@ -71,6 +71,7 @@ def ensure(con) -> None:
     con.execute("""INSERT OR IGNORE INTO pick_tags(pick_id, tag, set_at)
                    SELECT id, ?, fav_at FROM picks WHERE fav = 1""", (DEFAULT_TAGS[0],))
     con.execute("UPDATE picks SET fav = 0 WHERE fav = 1")
+    con.commit()
 
 
 def _now() -> str:
@@ -78,7 +79,7 @@ def _now() -> str:
 
 
 def record(con, board: pd.DataFrame, nxt: pd.DataFrame, current: pd.DataFrame, w_model: float,
-           now: pd.Timestamp | None = None, skip: set | None = None) -> int:
+           now: pd.Timestamp | None = None, skip: set | None = None, force: bool = False) -> int:
     """Καταγράφει/ενημερώνει από τον πίνακα αξίας (B.build). Επιστρέφει πόσες νέες εγγραφές έγιναν."""
     ensure(con)
     skip = skip or set()
@@ -106,7 +107,7 @@ def record(con, board: pd.DataFrame, nxt: pd.DataFrame, current: pd.DataFrame, w
                     price_med=_f(r.get("Τυπική απόδοση")), ev_med=_f(r.get("EV τυπικής")),
                     n_books=int(r.get("Εταιρείες αγοράς") or 0))
         if row is None:
-            if r["verdict"] not in RECORD:
+            if r["verdict"] not in RECORD and not force:
                 continue
             con.execute(
                 "INSERT INTO picks(first_seen, last_seen, player_id, player, team, opp, stat, line, side, price, bookmaker,"
@@ -184,6 +185,46 @@ def set_flag(con, ids, field: str, value: bool) -> None:
     ts = _now() if value else None
     con.executemany(f"UPDATE picks SET {field}=?, {field}_at=? WHERE id=?", [(int(value), ts, int(i)) for i in ids])
     con.commit()
+
+
+FAV = DEFAULT_TAGS[0]
+
+
+def pick_ids(con) -> dict:
+    """(παίκτης, αγορά, γραμμή, πλευρά, σεζόν, αγώνας) -> id καταγραφής."""
+    ensure(con)
+    return {(r[1], r[2], float(r[3]), r[4], int(r[5]), int(r[6])): r[0] for r in
+            con.execute("SELECT id, player_id, stat, line, side, season, game_code FROM picks")}
+
+
+def keys_with_tag(con, tag: str = FAV) -> set:
+    ensure(con)
+    return {(r[0], r[1], float(r[2]), r[3], int(r[4]), int(r[5])) for r in con.execute(
+        """SELECT p.player_id, p.stat, p.line, p.side, p.season, p.game_code FROM picks p
+           JOIN pick_tags t ON t.pick_id = p.id WHERE t.tag = ?""", (tag,))}
+
+
+def mark(con, rows: pd.DataFrame, nxt: pd.DataFrame, on: bool, tag: str = FAV, w_model: float = 0.5) -> int:
+    """Βάζει/βγάζει την ετικέτα σε στοιχήματα του πίνακα αξίας. Όσα δεν έχουν καταγραφεί (π.χ. «Ύποπτο»)
+    καταγράφονται πρώτα, για να μετρήσουν στο Αρχείο. Επιστρέφει πόσα άλλαξαν."""
+    if rows.empty:
+        return 0
+    if on:
+        record(con, rows, nxt, None, w_model, force=True)
+    ids = pick_ids(con)
+    n = 0
+    for r in rows.to_dict("records"):
+        team = r["Ομάδα"]
+        if team not in nxt.index:
+            continue
+        k = (r["player_id"], r["stat"], float(r["Γραμμή"]), r["side"], int(nxt.at[team, "season"]), int(nxt.at[team, "game_code"]))
+        i = ids.get(k)
+        if i is None:
+            continue
+        cur = {x[0] for x in con.execute("SELECT tag FROM pick_tags WHERE pick_id=?", (i,))}
+        set_tags(con, i, (cur | {tag}) if on else (cur - {tag}))
+        n += 1
+    return n
 
 
 def set_tags(con, pick_id: int, tags) -> None:

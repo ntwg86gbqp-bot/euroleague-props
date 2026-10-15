@@ -741,6 +741,8 @@ def page_value(D, nxt, w_model):
     disc = B.discarded_keys(con)
     disc_rows = b[b["_key"].isin(disc)]
     b = b[~b["_key"].isin(disc)].reset_index(drop=True)
+    b["_fav"] = b["_key"].isin(PK.keys_with_tag(con))
+    fav_section(b[b["_fav"]], nxt)
     b["_hidden"] = b["_key"].isin(hid)
     hidden_rows = b[b["_hidden"]]
     show_hidden = st.session_state.get("show_hidden", False)
@@ -784,11 +786,14 @@ def page_value(D, nxt, w_model):
               help="Στοιχήματα που έκρυψες εσύ. Μένουν κρυμμένα μόνο για τον επόμενο αγώνα του παίκτη.")
     hide_no = t1.toggle("Κρύψε όσα δεν αξίζουν", True)
     detail = t2.toggle("Αναλυτικές στήλες", False)
+    only_fav = st.toggle("Μόνο τα ⭐ Θα έπαιζα", False, key="only_fav") if b["_fav"].any() else False
     no_role = t3.toggle("Κρύψε παίκτες με νέο ρόλο", False,
                         help="Άλλαξαν ομάδα ή παίζουν τουλάχιστον 6′ διαφορετικά από πέρσι. Εκεί η πρόβλεψη είναι πιο αβέβαιη.")
     v = b[b["Αγώνες"] >= min_g]
     if hide_no:
         v = v[v["verdict"] != "no"]
+    if only_fav:
+        v = v[v["_fav"]]
     if no_role and "Νέος ρόλος" in v:
         v = v[~v["Νέος ρόλος"]]
     if stats:
@@ -808,7 +813,7 @@ def page_value(D, nxt, w_model):
         heading(st, "Όλα τα στοιχήματα", f"{len(v)} στοιχήματα, τα καλύτερα πρώτα. Διάλεξε ένα από τη λίστα στο τέλος για την ανάλυσή του.")
         cards = ""
         for _, r in v.head(40).iterrows():
-            cards += (f'<div class="el-bet" style="--vc:{V_COLOR[r["verdict"]]}"><div class="top"><span class="who">{esc(short(r["Παίκτης"]))}{" ⚠️" if r.get("Νέος ρόλος") else ""} '
+            cards += (f'<div class="el-bet" style="--vc:{V_COLOR[r["verdict"]]}"><div class="top"><span class="who">{"⭐ " if r.get("_fav") else ""}{esc(short(r["Παίκτης"]))}{" ⚠️" if r.get("Νέος ρόλος") else ""} '
                       f'<span style="color:var(--muted);font-weight:400">με {esc(r["Αντίπαλος"])}</span></span>'
                       f'<span class="chip">{V_NAME[r["verdict"]]}</span></div><div class="bet">{esc(r["Στοίχημα"])}</div>'
                       f'<div class="nums"><span><i>Απόδοση</i><b>{r["Απόδοση"]:.2f}</b></span>'
@@ -818,10 +823,14 @@ def page_value(D, nxt, w_model):
         st.markdown(cards, unsafe_allow_html=True)
         if len(v) > 40:
             st.caption(f"Δείχνω τα 40 καλύτερα από {len(v)}. Στένεψε με τα φίλτρα για τα υπόλοιπα.")
-        with st.expander("Πέταγμα πολλών μαζί"):
+        with st.expander("⭐ Θα έπαιζα / 🗑️ Πέταγμα (πολλά μαζί)"):
             many = st.multiselect("Διάλεξε στοιχήματα", list(range(len(v))), key="m_disc", placeholder="Κανένα",
-                                  format_func=lambda i: f"{short(v.at[i, 'Παίκτης'])} · {v.at[i, 'Στοίχημα']} @{v.at[i, 'Απόδοση']:.2f}")
-            discard_many(st, v.iloc[many] if many else v.iloc[[]], "disc_m")
+                                  format_func=lambda i: ("⭐ " if v.at[i, "_fav"] else "") +
+                                  f"{short(v.at[i, 'Παίκτης'])} · {v.at[i, 'Στοίχημα']} @{v.at[i, 'Απόδοση']:.2f}")
+            sel_ = v.iloc[many] if many else v.iloc[[]]
+            m1, m2 = st.columns(2)
+            fav_many(m1, sel_, nxt, "fav_m")
+            discard_many(m2, sel_, "disc_m")
         pick = st.selectbox("Ανάλυση παίκτη", [None] + list(range(len(v))), key="m_pick",
                             format_func=lambda i: "Διάλεξε στοίχημα…" if i is None else f"{short(v.at[i, 'Παίκτης'])} · {v.at[i, 'Στοίχημα']}")
         if pick is not None:
@@ -837,14 +846,14 @@ def page_value(D, nxt, w_model):
     show = v.assign(**{"Αναμ. κέρδος": v["EV"] * 100, "Μοντέλο": v["P μοντέλου"] * 100,
                        "Αγορά ": v["P αγοράς"].astype(float) * 100, "Πιθανότητα": v["P τελική"] * 100,
                        "Ποντάρισμα": v["Kelly/4"] * 100,
-                       "Παίκτης": [("🙈 " if h_ else "") + n.title() + (" ⚠️" if r_ else "")
-                                   for n, r_, h_ in zip(v["Παίκτης"], v.get("Νέος ρόλος", [False] * len(v)), v["_hidden"])]})
+                       "Παίκτης": [("⭐ " if f_ else "") + ("🙈 " if h_ else "") + n.title() + (" ⚠️" if r_ else "")
+                                   for n, r_, h_, f_ in zip(v["Παίκτης"], v.get("Νέος ρόλος", [False] * len(v)), v["_hidden"], v["_fav"])]})
     cols = ["Ετυμηγορία", "Παίκτης", "Στοίχημα", "Αντίπαλος", "Απόδοση", "Εταιρεία", "Τυπική απόδοση", "Αναμ. κέρδος", "Πιθανότητα",
             "Τελευταίοι 10", "Φόρμα", "Γιατί"]
     if detail:
         cols = cols[:-1] + ["Μοντέλο", "Αγορά ", "Πρόβλεψη", "Λεπτά", "Σεζόν", "Ποντάρισμα", "Εταιρείες αγοράς", "Γιατί"]
     heading(st, "Όλα τα στοιχήματα", "Κλικ στο κουτάκι αριστερά από μια γραμμή για να ανοίξει η ανάλυση του παίκτη από κάτω. "
-            "Τσέκαρε πολλά για να τα πετάξεις μαζί. "
+            "Τσέκαρε ένα ή πολλά για να τα βάλεις στα «⭐ Θα έπαιζα» ή να τα πετάξεις. "
             "Άφησε το ποντίκι πάνω στον τίτλο μιας στήλης για να δεις τι σημαίνει.")
     ev = st.dataframe(
         show[cols], hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row", key="board",
@@ -881,7 +890,9 @@ def page_value(D, nxt, w_model):
     discard_list(disc_rows)
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(v)]
     if sel:
-        discard_many(st, v.iloc[sel], "disc_d")
+        bc_ = st.columns([1, 1, 3])
+        fav_many(bc_[0], v.iloc[sel], nxt, "fav_d")
+        discard_many(bc_[1], v.iloc[sel], "disc_d")
     if len(sel) > 1:
         st.caption(f"Επέλεξες {len(sel)} στοιχήματα. Η ανάλυση δείχνει το τελευταίο.")
     if sel:
@@ -922,6 +933,45 @@ def discard_list(rows: pd.DataFrame):
             if c2.button("Επαναφορά", key=f"undisc_{i}"):
                 B.set_discarded(con, [r["_key"]], False)
                 st.rerun()
+
+
+def fav_section(rows: pd.DataFrame, nxt):
+    """Τα στοιχήματα που σημείωσες «Θα το έπαιζα», ξεχωριστά στην κορυφή."""
+    if rows.empty:
+        return
+    heading(st, f"⭐ Θα έπαιζα ({len(rows)})", "Όσα διάλεξες. Μετράνε στο Αρχείο με την ετικέτα «Θα τα έπαιζα», "
+            "σημειωμένα πριν τον αγώνα, άρα με τίμιο ποσοστό.")
+    rows = rows.reset_index(drop=True)
+    t = pd.DataFrame({"Παίκτης": [short(n) if is_mobile() else n.title() for n in rows["Παίκτης"]],
+                      "Στοίχημα": rows["Στοίχημα"], "Αντίπαλος": rows["Αντίπαλος"],
+                      "Τυπική": rows["Τυπική απόδοση"], "Καλύτερη": rows["Απόδοση"],
+                      "Πιθανότητα": rows["P τελική"] * 100, "Αναμ. κέρδος": rows["EV τυπικής"] * 100,
+                      "Ετυμηγορία": rows["verdict"].map(V_NAME), "Βγάλε": False})
+    cols = ["Βγάλε", "Παίκτης", "Στοίχημα", "Τυπική", "Αναμ. κέρδος"] if is_mobile() else list(t.columns[-1:]) + list(t.columns[:-1])
+    ed = st.data_editor(t[cols], hide_index=True, width="stretch", key="fav_tbl",
+                        disabled=[c for c in cols if c != "Βγάλε"], column_config={
+                            "Βγάλε": st.column_config.CheckboxColumn("✕", width=34, help="Τσέκαρε για να το βγάλεις από τα «Θα έπαιζα»."),
+                            "Τυπική": st.column_config.NumberColumn(format="%.2f"), "Καλύτερη": st.column_config.NumberColumn(format="%.2f"),
+                            "Πιθανότητα": st.column_config.NumberColumn(format="%.0f%%"),
+                            "Αναμ. κέρδος": st.column_config.NumberColumn(format="%+.1f%%", help="Στην τυπική απόδοση.")})
+    out = rows[ed["Βγάλε"].to_numpy()]
+    if len(out) and st.button(f"Βγάλε {len(out)} από τα «Θα έπαιζα»", key="fav_rm"):
+        PK.mark(con, out, nxt, False)
+        st.rerun()
+    st.write("")
+
+
+def fav_many(target, rows: pd.DataFrame, nxt, key: str):
+    """Κουμπί που βάζει τα επιλεγμένα στα «Θα έπαιζα» (ή τα βγάζει αν είναι όλα ήδη εκεί)."""
+    if rows.empty:
+        return
+    all_in = bool(rows["_fav"].all())
+    lab = f"Βγάλε από τα «Θα έπαιζα» ({len(rows)})" if all_in else f"⭐ Θα το έπαιζα ({len(rows)})"
+    if target.button(lab, key=key, type="secondary" if all_in else "primary",
+                     help="Τα ξεχωρίζει στην κορυφή της σελίδας και τα μετράει στο Αρχείο με την ετικέτα «Θα τα έπαιζα»."):
+        PK.mark(con, rows, nxt, not all_in)
+        st.session_state.pop("board", None)
+        st.rerun()
 
 
 def discard_many(target, rows: pd.DataFrame, key: str):
