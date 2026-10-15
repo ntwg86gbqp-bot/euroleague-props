@@ -78,9 +78,10 @@ def _now() -> str:
 
 
 def record(con, board: pd.DataFrame, nxt: pd.DataFrame, current: pd.DataFrame, w_model: float,
-           now: pd.Timestamp | None = None) -> int:
+           now: pd.Timestamp | None = None, skip: set | None = None) -> int:
     """Καταγράφει/ενημερώνει από τον πίνακα αξίας (B.build). Επιστρέφει πόσες νέες εγγραφές έγιναν."""
     ensure(con)
+    skip = skip or set()
     if board is None or board.empty:
         return 0
     now = now or pd.Timestamp.now(tz="UTC")
@@ -95,6 +96,8 @@ def record(con, board: pd.DataFrame, nxt: pd.DataFrame, current: pd.DataFrame, w
         if pd.isna(gdate) or gdate <= now:
             continue                                   # μόνο πριν από το τζάμπολ
         key = (r["player_id"], r["stat"], float(r["Γραμμή"]), r["side"], int(g["season"]), int(g["game_code"]))
+        if key in skip:
+            continue
         row = con.execute("SELECT id, verdict, status FROM picks WHERE player_id=? AND stat=? AND line=? AND side=? "
                           "AND season=? AND game_code=?", key).fetchone()
         vals = dict(price=float(r["Απόδοση"]), bookmaker=r.get("Εταιρεία"), p_model=_f(r.get("P μοντέλου")),

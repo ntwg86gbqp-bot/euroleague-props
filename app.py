@@ -416,6 +416,14 @@ def pct(x):
     return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{100 * x:.0f}%"
 
 
+def max_odds() -> float:
+    """Πάνω από αυτή την τυπική απόδοση τίποτα δεν βγαίνει «Αξίζει»/«Οριακό» (ρύθμιση του χρήστη)."""
+    try:
+        return float(O.load_config().get("max_odds", 3.0))
+    except (TypeError, ValueError):
+        return 3.0
+
+
 def live_odds(D):
     """Οι τρέχουσες αποδόσεις, χωρίς όσες ανήκουν σε αγώνα που έχει ήδη αρχίσει."""
     return B.fresh_odds(O.latest(con), D["current"], con)
@@ -425,12 +433,14 @@ def board_for(D, nxt, w_model):
     """(αποδόσεις, πίνακας αξίας), υπολογισμένα μία φορά ανά αλλαγή δεδομένων/αποδόσεων/ρυθμίσεων."""
     odds = live_odds(D)
     books = O.my_books()
-    key = (tuple(books), data_sig(), con.execute("SELECT COALESCE(MAX(id), 0) FROM odds").fetchone()[0], round(float(w_model), 3),
+    mx = max_odds()
+    key = (mx, tuple(books), data_sig(), con.execute("SELECT COALESCE(MAX(id), 0) FROM odds").fetchone()[0], round(float(w_model), 3),
            tuple(sorted(D["ctx"].get("absent", set()))), tuple(nxt["game_code"].astype(str)) if len(nxt) else (), len(odds))
     hit = st.session_state.get("_board")
     if hit and hit[0] == key:
         return hit[1], hit[2]
-    b = B.build(odds, D["df"], D["current"], D["ctx"], D["disp"], nxt, w_model, books=books) if not odds.empty else pd.DataFrame()
+    b = B.build(odds, D["df"], D["current"], D["ctx"], D["disp"], nxt, w_model, books=books, max_odds=mx) \
+        if not odds.empty else pd.DataFrame()
     st.session_state["_board"] = (key, odds, b)
     return odds, b
 
@@ -728,6 +738,9 @@ def page_value(D, nxt, w_model):
     # --- κρυμμένα στοιχήματα (επιλογή του χρήστη, για τον επόμενο αγώνα)
     hid = B.hidden_keys(con)
     b = b.assign(_key=[B.bet_key(r, nxt) for r in b.to_dict("records")])
+    disc = B.discarded_keys(con)
+    disc_rows = b[b["_key"].isin(disc)]
+    b = b[~b["_key"].isin(disc)].reset_index(drop=True)
     b["_hidden"] = b["_key"].isin(hid)
     hidden_rows = b[b["_hidden"]]
     show_hidden = st.session_state.get("show_hidden", False)
@@ -805,6 +818,10 @@ def page_value(D, nxt, w_model):
         st.markdown(cards, unsafe_allow_html=True)
         if len(v) > 40:
             st.caption(f"Δείχνω τα 40 καλύτερα από {len(v)}. Στένεψε με τα φίλτρα για τα υπόλοιπα.")
+        with st.expander("Πέταγμα πολλών μαζί"):
+            many = st.multiselect("Διάλεξε στοιχήματα", list(range(len(v))), key="m_disc", placeholder="Κανένα",
+                                  format_func=lambda i: f"{short(v.at[i, 'Παίκτης'])} · {v.at[i, 'Στοίχημα']} @{v.at[i, 'Απόδοση']:.2f}")
+            discard_many(st, v.iloc[many] if many else v.iloc[[]], "disc_m")
         pick = st.selectbox("Ανάλυση παίκτη", [None] + list(range(len(v))), key="m_pick",
                             format_func=lambda i: "Διάλεξε στοίχημα…" if i is None else f"{short(v.at[i, 'Παίκτης'])} · {v.at[i, 'Στοίχημα']}")
         if pick is not None:
@@ -815,6 +832,7 @@ def page_value(D, nxt, w_model):
             render_player(D, nxt, r.player_id, r.stat, float(r["Γραμμή"]), best.get("over"), best.get("under"),
                           key="v", side=r["side"], w_model=w_model)
         hidden_list(hidden_rows)
+        discard_list(disc_rows)
         return
     show = v.assign(**{"Αναμ. κέρδος": v["EV"] * 100, "Μοντέλο": v["P μοντέλου"] * 100,
                        "Αγορά ": v["P αγοράς"].astype(float) * 100, "Πιθανότητα": v["P τελική"] * 100,
@@ -826,9 +844,10 @@ def page_value(D, nxt, w_model):
     if detail:
         cols = cols[:-1] + ["Μοντέλο", "Αγορά ", "Πρόβλεψη", "Λεπτά", "Σεζόν", "Ποντάρισμα", "Εταιρείες αγοράς", "Γιατί"]
     heading(st, "Όλα τα στοιχήματα", "Κλικ στο κουτάκι αριστερά από μια γραμμή για να ανοίξει η ανάλυση του παίκτη από κάτω. "
+            "Τσέκαρε πολλά για να τα πετάξεις μαζί. "
             "Άφησε το ποντίκι πάνω στον τίτλο μιας στήλης για να δεις τι σημαίνει.")
     ev = st.dataframe(
-        show[cols], hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="board",
+        show[cols], hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row", key="board",
         column_config={
             "Ετυμηγορία": st.column_config.TextColumn(width="small", help=GLOSS["Ετυμηγορία"]),
             "Στοίχημα": st.column_config.TextColumn(help=GLOSS["Over / Under"]),
@@ -859,9 +878,14 @@ def page_value(D, nxt, w_model):
         g1.markdown(gloss_html(["Ετυμηγορία", "Over / Under", "Απόδοση", "Αναμενόμενο κέρδος", "Πιθανότητα"]), unsafe_allow_html=True)
         g2.markdown(gloss_html(["Τελευταίοι 10", "Φόρμα", "Πιθανότητα μοντέλου", "Πιθανότητα αγοράς", "Ποντάρισμα"]), unsafe_allow_html=True)
     hidden_list(hidden_rows)
-    sel = ev.selection.rows if ev and ev.selection else []
-    if sel and sel[0] < len(v):
-        r = v.iloc[sel[0]]
+    discard_list(disc_rows)
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(v)]
+    if sel:
+        discard_many(st, v.iloc[sel], "disc_d")
+    if len(sel) > 1:
+        st.caption(f"Επέλεξες {len(sel)} στοιχήματα. Η ανάλυση δείχνει το τελευταίο.")
+    if sel:
+        r = v.iloc[sel[-1]]
         o = odds[(odds.player_id == r.player_id) & (odds.stat == r.stat) & (odds.line == r["Γραμμή"])]
         best = o.groupby("side")["price"].max()
         st.divider()
@@ -880,6 +904,32 @@ def hide_button(target, row, nxt, key: str):
     if target.button(lab, key=key, help="Το κρύβει από τη σελίδα «Αξία» μέχρι τον επόμενο αγώνα του παίκτη. "
                                         "Στο Αρχείο μένει, με σήμανση «κρυμμένο», για να φαίνεται αν είχες δίκιο."):
         B.set_hidden(con, k, not hidden)
+        st.session_state.pop("board", None)
+        st.rerun()
+
+
+def discard_list(rows: pd.DataFrame):
+    if rows.empty:
+        return
+    with st.expander(f"Πεταμένα στοιχήματα ({len(rows)})"):
+        st.caption("Δεν φαίνονται στην Αξία και δεν καταγράφονται στο Αρχείο. Η επαναφορά τα ξαναφέρνει και τα καταγράφει από τώρα.")
+        if st.button("Επαναφορά όλων", key="undisc_all"):
+            B.set_discarded(con, list(rows["_key"]), False)
+            st.rerun()
+        for i, r in enumerate(rows.to_dict("records")):
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(f'{esc(short(r["Παίκτης"]))} · {esc(r["Στοίχημα"])} · {r["Απόδοση"]:.2f}')
+            if c2.button("Επαναφορά", key=f"undisc_{i}"):
+                B.set_discarded(con, [r["_key"]], False)
+                st.rerun()
+
+
+def discard_many(target, rows: pd.DataFrame, key: str):
+    """Κουμπί που πετάει όλα τα στοιχήματα του rows μαζί."""
+    keys = [k for k in rows["_key"] if k is not None]
+    if keys and target.button(f"🗑️ Πέτα τα επιλεγμένα ({len(keys)})", key=key, type="primary",
+                              help="Φεύγουν από την Αξία και από το Αρχείο (και δεν ξανακαταγράφονται). Επαναφέρονται από τη λίστα «Πεταμένα»."):
+        B.set_discarded(con, keys, True)
         st.session_state.pop("board", None)
         st.rerun()
 
@@ -2085,6 +2135,12 @@ def page_archive(D, embedded: bool = False):
                                 help="Όσα εξαίρεσες (στήλη ✕ του πίνακα) δεν μετράνε πουθενά, εκτός αν δεις «Μόνο αυτές».") or "all"
     v = d[d["verdict"].isin(vs)]
     v = v[v["excluded"] == (1 if view == "exc" else 0)]
+    mx = max_odds()
+    n_over = int((v["price_typ"] > mx).sum())
+    if n_over and st.toggle(f"Με τους τωρινούς κανόνες: χωρίς τυπική απόδοση πάνω από {mx:.2f} ({n_over})", True, key="arc_mx",
+                            help="Οι παλιές καταγραφές έγιναν πριν μπει το όριο. Με αυτό ανοιχτό, τα ποσοστά βγαίνουν σαν να "
+                                 "ίσχυε από την αρχή. Το όριο αλλάζει στις Ρυθμίσεις."):
+        v = v[v["price_typ"] <= mx]
     tg_ok = tg[tg["before"]] if only_before else tg
 
     def with_tags(x: pd.DataFrame, chosen) -> pd.DataFrame:
@@ -2397,6 +2453,14 @@ with st.sidebar:
             w_model = st.slider("Πόσο εμπιστεύομαι το μοντέλο έναντι της αγοράς", 0.0, 1.0, 0.5, 0.05,
                                 help="Η αγορά ξέρει πράγματα που το μοντέλο αγνοεί (τραυματισμούς, ρόλους). "
                                      "Στο 0.5 το αναμενόμενο κέρδος μετριέται συντηρητικά. Στο 1.0 μετράει μόνο το μοντέλο.")
+            mx_ = st.number_input("Μέγιστη απόδοση για «Αξίζει»", 1.2, 20.0, max_odds(), 0.1, format="%.2f",
+                                  help="Στην τυπική απόδοση (διάμεσος των εταιρειών). Από πάνω, τίποτα δεν βγαίνει «Αξίζει» ή "
+                                       "«Οριακό» ούτε καταγράφεται στο Αρχείο. Κόβει τις «σκάλες» με τις μεγάλες αποδόσεις, όπου το "
+                                       "μοντέλο υπερεκτιμά το κέρδος.")
+            if abs(mx_ - max_odds()) > 1e-9:
+                O.save_config({**O.load_config(), "max_odds": float(mx_)})
+                st.session_state.pop("_board", None)
+                st.rerun()
             st.toggle("Διάταξη κινητού", value=_auto_mobile(), key="mobile_view",
                       help="Μενού στο πάνω μέρος, κάρτες αντί για φαρδιούς πίνακες. Ανοίγει μόνη της όταν μπαίνεις από κινητό.")
             url_, rem_ = (None, None) if CLOUD else (lan_url(), remote_url())
@@ -2463,7 +2527,7 @@ else:
     try:
         # πάντα με τη σταθερή ρύθμιση 0.5, ό,τι κι αν δείχνει η οθόνη, για να μετράει το Αρχείο έναν κανόνα
         _, b_auto = board_for(D, nxt, 0.5)
-        n_new = PK.record(con, b_auto, nxt, D["current"], 0.5)
+        n_new = PK.record(con, b_auto, nxt, D["current"], 0.5, skip=B.discarded_keys(con))
         if n_new:
             st.toast(f"Καταγράφηκαν {n_new} νέα στοιχήματα στο Αρχείο.")
     except Exception as e:  # noqa: BLE001  — η καταγραφή δεν πρέπει ποτέ να ρίξει την εφαρμογή

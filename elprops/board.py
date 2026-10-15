@@ -57,6 +57,29 @@ def bet_key(row, nxt: pd.DataFrame):
             int(nxt.at[team, "season"]), int(nxt.at[team, "game_code"]))
 
 
+def discarded_keys(con) -> set:
+    """Στοιχήματα που πέταξε ο χρήστης: δεν φαίνονται στην Αξία και δεν καταγράφονται στο Αρχείο."""
+    try:
+        return {(r[0], r[1], float(r[2]), r[3], int(r[4]), int(r[5])) for r in
+                con.execute("SELECT player_id, stat, line, side, season, game_code FROM discarded_bets")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def set_discarded(con, keys, discarded: bool) -> None:
+    ts = pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds")
+    for k in keys:
+        if discarded:
+            con.execute("INSERT OR REPLACE INTO discarded_bets VALUES (?,?,?,?,?,?,?)", (*k, ts))
+            # αν είχε ήδη καταγραφεί (ανοιχτό), βγαίνει από το Αρχείο
+            con.execute("DELETE FROM picks WHERE status='open' AND player_id=? AND stat=? AND line=? AND side=? "
+                        "AND season=? AND game_code=?", k)
+        else:
+            con.execute("DELETE FROM discarded_bets WHERE player_id=? AND stat=? AND line=? AND side=? "
+                        "AND season=? AND game_code=?", k)
+    con.commit()
+
+
 def set_hidden(con, key, hidden: bool) -> None:
     if hidden:
         con.execute("INSERT OR REPLACE INTO hidden_bets VALUES (?,?,?,?,?,?,?)",
@@ -114,7 +137,7 @@ VERDICTS = {"strong": "🟢 Αξίζει", "marginal": "🟡 Οριακό", "sus
 
 
 def verdict(ev: float, p_model: float, p_mkt, n_games: int, tail: bool = False, outlier: bool = False,
-            n_books: int = 0) -> str:
+            n_books: int = 0, too_high: bool = False) -> str:
     """Ετυμηγορία σε απλά λόγια.
 
     suspect : φαίνεται κερδοφόρο, αλλά το μοντέλο διαφωνεί με την αγορά πάνω από 18 μονάδες
@@ -122,6 +145,8 @@ def verdict(ev: float, p_model: float, p_mkt, n_games: int, tail: bool = False, 
     strong  : EV >= 6%, αρκετό ιστορικό, και το μοντέλο πάνω από την αγορά τουλάχιστον 4 μονάδες
     marginal: EV >= 2%
     """
+    if too_high:
+        return "no"           # πάνω από το όριο απόδοσης του χρήστη
     gap = None if p_mkt is None else p_model - p_mkt
     # όταν πολλές εταιρείες συμφωνούν, η αγορά είναι πιο αξιόπιστη: ανεχόμαστε μικρότερη διαφωνία
     max_gap = 0.12 if n_books >= 10 else 0.18
@@ -180,7 +205,7 @@ def playable(odds: pd.DataFrame, books) -> pd.Series:
 
 def build(odds: pd.DataFrame, df: pd.DataFrame, current: pd.DataFrame, ctx: dict,
           disp: dict, nxt: pd.DataFrame, w_model: float = 0.5,
-          assumed_margin: float = 0.07, books=None) -> pd.DataFrame:
+          assumed_margin: float = 0.07, books=None, max_odds: float | None = None) -> pd.DataFrame:
     """Πίνακας αξίας.
 
     books: οι εταιρείες όπου μπορείς να παίξεις (κενό = όλες). Η αγορά (πιθανότητα χωρίς γκανιότα) υπολογίζεται
@@ -261,7 +286,8 @@ def build(odds: pd.DataFrame, df: pd.DataFrame, current: pd.DataFrame, ctx: dict
             ev_ = M.ev(p_win, p_lose, price)
             tail = is_tail(line, mu, side)
             outlier = bool(pk_side and n_books >= 3 and price > OUTLIER / pk_side)
-            vd = verdict(ev_, pm_side, pk_side, n_g, tail, outlier, n_books)
+            too_high = bool(max_odds) and typ > max_odds
+            vd = verdict(ev_, pm_side, pk_side, n_g, tail, outlier, n_books, too_high)
             last5 = vals[-5:]
             rows.append({
                 "verdict": vd, "Ετυμηγορία": VERDICTS[vd],
@@ -271,7 +297,8 @@ def build(odds: pd.DataFrame, df: pd.DataFrame, current: pd.DataFrame, ctx: dict
                          + (" · " + rn if (rn := M.role_note(pid, ctx, current)) else "")
                          + (" · ψηλή γραμμή: το μοντέλο υπερεκτιμά τις μεγάλες βραδιές" if tail and vd == "suspect" else "")
                          + (f" · η απόδοση είναι πολύ πάνω από τις άλλες {n_books} εταιρείες (τυπική {typ:.2f}): "
-                            "πιθανό λάθος ή παλιά γραμμή" if outlier and vd == "suspect" else ""),
+                            "πιθανό λάθος ή παλιά γραμμή" if outlier and vd == "suspect" else "")
+                         + (f" · τυπική απόδοση {typ:.2f}, πάνω από το όριό σου {max_odds:.2f}" if too_high and ev_ >= 0.02 else ""),
                 "p_mkt_side": pk_side,
                 "Τελευταίοι 10": [float(x) for x in vals[-10:]],
                 "Φόρμα": "".join("–" if x == line else ("✓" if (x > line) == (side == "over") else "✗")
