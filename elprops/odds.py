@@ -157,7 +157,27 @@ def side_from_outcome(name: str) -> str | None:
 # ---------- OddsPapi ----------
 
 class OddsPapiError(RuntimeError):
-    pass
+    def __init__(self, msg: str, retry_after: float | None = None):
+        super().__init__(msg)
+        self.retry_after = retry_after          # δευτερόλεπτα που ζήτησε το API να περιμένουμε (όταν κόβει)
+
+
+def _wait_of(r) -> float | None:
+    """Πόσο ζητάει να περιμένουμε μια απάντηση 429: Retry-After, retryAfterSec ή X-RateLimit-Reset."""
+    for h in ("Retry-After", "X-RateLimit-Reset"):
+        try:
+            v = float(r.headers.get(h, ""))
+            return v - time.time() if v > 1e9 else v       # Reset μπορεί να είναι χρονοσφραγίδα
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float((r.json() or {}).get("retryAfterSec"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _human(sec: float) -> str:
+    return f"{sec:.0f} δευτερόλεπτα" if sec < 90 else f"{sec / 60:.0f} λεπτά" if sec < 5400 else f"{sec / 3600:.1f} ώρες"
 
 
 def _get(path: str, key: str, **params):
@@ -166,13 +186,12 @@ def _get(path: str, key: str, **params):
     for attempt in range(4):
         r = requests.get(f"{BASE}/{path}", params=q, timeout=120)
         if r.status_code == 429:
-            # όσο ζητάει το ίδιο το API (Retry-After), αλλιώς 3, 6, 9 δευτερόλεπτα· ποτέ πάνω από 20
-            try:
-                wait = float(r.headers.get("Retry-After", ""))
-            except ValueError:
-                wait = 3.0 * (attempt + 1)
+            # όσο ζητάει το ίδιο το API, αλλιώς 3, 6, 9 δευτερόλεπτα· αν ζητάει πάνω από 20, σταματάμε εδώ
+            asked = _wait_of(r)
+            wait = asked if asked is not None else 3.0 * (attempt + 1)
             if wait > 20:
-                break
+                raise OddsPapiError(f"το OddsPapi κόβει τα αιτήματα στο /{path} και ζητάει αναμονή {_human(wait)}.",
+                                    retry_after=wait)
             time.sleep(max(wait, 1.0))
             continue
         if r.status_code == 404:
@@ -245,7 +264,7 @@ def prop_markets(key: str, refresh: bool = False) -> dict[str, dict]:
 
 def _download_markets(key: str) -> dict[str, dict]:
     out = {}
-    for m in _get("markets", key) or []:
+    for m in _get("markets", key, sportId=BASKETBALL_SPORT) or []:      # μόνο μπάσκετ: πολύ μικρότερο αίτημα
         if m.get("sportId") != BASKETBALL_SPORT or not m.get("playerProp"):
             continue
         out[str(m["marketId"])] = {
