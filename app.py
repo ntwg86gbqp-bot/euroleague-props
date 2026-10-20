@@ -2200,6 +2200,46 @@ def round_picker(d: pd.DataFrame, key: str):
     return d[keep], sel, lab
 
 
+def category_picker(d: pd.DataFrame):
+    """Ποια στοιχήματα μετράνε: ετυμηγορία, πλευρά, αγορές, ετικέτα. Επιστρέφει (φιλτραρισμένο d, περιγραφή)."""
+    mob = is_mobile()
+    c = st.columns([3, 2, 4, 3]) if not mob else st.columns(2)
+    vs = c[0].segmented_control("Ετυμηγορία", ["strong", "marginal"], format_func=V_NAME.get, selection_mode="multi",
+                                default=["strong"], key="res_v",
+                                help="Καταγράφονται μόνο τα «Αξίζει» και τα «Οριακά».") or ["strong"]
+    sides = c[1].segmented_control("Πλευρά", ["over", "under"], format_func=str.title, selection_mode="multi",
+                                   default=["over", "under"], key="res_side") or ["over", "under"]
+    stats = (c[2] if not mob else st).multiselect("Αγορές", [k for k in M.KEYS if k in set(d["stat"])], format_func=STAT_LABEL.get,
+                                                  placeholder="Όλες", key="res_stats")
+    tags_all = PK.all_tags(con) if len(d) else []
+    tags = (c[3] if not mob else st).multiselect("Ετικέτα", tags_all, placeholder="Όλα", key="res_tags",
+                                                 help="Μόνο όσα είχαν την ετικέτα ΠΡΙΝ τον αγώνα: έτσι το ποσοστό είναι τίμιο.")
+    out = d[d["verdict"].isin(vs) & d["side"].isin(sides)]
+    if stats:
+        out = out[out["stat"].isin(stats)]
+    late = False
+    if tags and len(out):
+        tg = PK.load_tags(con, d)
+        tg = tg[tg["tag"].isin(tags)]
+        n_pre = int(tg["before"].sum())
+        late = st.toggle(f"Και όσες μπήκαν μετά τον αγώνα ({int((~tg['before']).sum())})", False, key="res_tags_late",
+                         help="Εκ των υστέρων ετικέτες: ήξερες ήδη το αποτέλεσμα, οπότε το ποσοστό βγαίνει καλύτερο απ' ό,τι είναι.")
+        if not n_pre and not late:
+            st.caption("⚠️ Καμία από αυτές τις ετικέτες δεν μπήκε πριν τον αγώνα. Βάζε ⭐ πριν το τζάμπολ για να μετράει τίμια.")
+        out = out[out["id"].isin(set(tg.loc[tg["before"] | late, "pick_id"]))]
+    desc = " + ".join("«" + V_NAME[v] + "»" for v in vs)
+    if len(sides) == 1:
+        desc += f" {sides[0].title()}"
+    if stats:
+        desc += " σε " + ", ".join(STAT_LABEL[k].lower() for k in stats)
+    if tags:
+        desc += " με ετικέτα " + ", ".join(f"«{t}»" for t in tags) + (" (και εκ των υστέρων)" if late else "")
+    if late:
+        st.markdown(f'<div class="el-leg" style="color:{WARN}">⚠️ Μετράνε και ετικέτες που μπήκαν μετά τον αγώνα: '
+                    'το ποσοστό είναι αισιόδοξο.</div>', unsafe_allow_html=True)
+    return out, desc
+
+
 def per_round(target, base: pd.DataFrame):
     """Κέρδος ανά αγωνιστική: μπάρες, και πίνακας για όποιον θέλει τα νούμερα."""
     s = base[base["status"].isin(["won", "lost"])].dropna(subset=["round"])
@@ -2215,7 +2255,7 @@ def per_round(target, base: pd.DataFrame):
     T = pd.DataFrame(rows)
     T["Πρόσημο"] = np.where(T["Μονάδες"] >= 0, "κέρδος", "ζημιά")
     heading(target, "Ανά αγωνιστική", sw(V_COLOR["strong"], "κέρδος") + sw(V_COLOR["suspect"], "ζημιά")
-            + "Μονάδες με 1 μονάδα σε κάθε «Αξίζει». Μία αγωνιστική μόνη της είναι κυρίως τύχη.")
+            + "Με 1 μονάδα σε κάθε στοίχημα. Μία αγωνιστική μόνη της είναι κυρίως τύχη.")
     base_ = alt.Chart(T).encode(x=alt.X("Αγωνιστική:N", sort=list(T["Αγωνιστική"]), title=None, axis=alt.Axis(labelAngle=0)))
     bars = base_.mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3, size=min(46, 420 // len(T))).encode(
         y=alt.Y("Μονάδες:Q", title=None),
@@ -2261,10 +2301,11 @@ def _units_chart(target, s: pd.DataFrame, height: int = 240):
     show_chart(target, alt.layer(*layers).properties(height=height))
 
 
-def results_headline(d: pd.DataFrame, scope: str = "όλες οι αγωνιστικές"):
-    """Το σκορ με μια ματιά: τα «Αξίζει» του Αρχείου, με τους τωρινούς κανόνες, χωρίς τις εξαιρέσεις."""
+def results_headline(d: pd.DataFrame, scope: str = "όλες οι αγωνιστικές", what: str = "«Αξίζει»"):
+    """Το σκορ με μια ματιά, για ό,τι έχει ήδη επιλεγεί (κατηγορία, αγωνιστικές), με τους τωρινούς κανόνες,
+    χωρίς τις εξαιρέσεις."""
     mx = max_odds()
-    base = d[(d["verdict"] == "strong") & (d["excluded"] == 0) & (d["price_typ"] <= mx)] if len(d) else d
+    base = d[(d["excluded"] == 0) & (d["price_typ"] <= mx)] if len(d) else d
     if base.empty:
         st.info("Τίποτα καταγεγραμμένο εδώ ακόμα. Κάθε «Αξίζει» καταγράφεται μόνο του τη στιγμή που εμφανίζεται.")
         return
@@ -2275,7 +2316,7 @@ def results_headline(d: pd.DataFrame, scope: str = "όλες οι αγωνιστ
     GOODC, BADC = V_COLOR["strong"], V_COLOR["suspect"]
     vc, t, msg = _edge_verdict(sm)
     st.markdown(f'<div class="el-verdict" style="--vc:{vc}"><div class="t"><b>{esc(t)}</b></div><div class="s">{esc(msg)}</div>'
-                f'<div class="m">Τα «Αξίζει» που κατέγραψε μόνη της η εφαρμογή, {esc(scope)}: {sm["n"]} κλεισμένα σε {sm["games"]} αγώνες, '
+                f'<div class="m">{esc(what)}, {esc(scope)}: {sm["n"]} κλεισμένα σε {sm["games"]} αγώνες, '
                 f'{sm["n_open"]} ανοιχτά. Τυπική απόδοση έως {mx:.2f}, χωρίς όσα εξαίρεσες.</div></div>', unsafe_allow_html=True)
     col_u = GOODC if sm["units"] > 0 else BADC if sm["units"] < 0 else None
     edge = sm["hit"] - sm["exp_market"]
@@ -2317,11 +2358,7 @@ def page_archive(D, d: pd.DataFrame | None = None):
     bar = st.container(horizontal=True, gap="small")
     filt = bar.popover("Φίλτρα", icon=":material/tune:")
     with filt:
-        vs = st.segmented_control("Ετυμηγορία", ["strong", "marginal"], format_func=V_NAME.get, selection_mode="multi",
-                                  default=["strong"], key="arc_v") or ["strong"]
-        stats = st.multiselect("Αγορές", sorted(d["stat"].unique(), key=M.KEYS.index), format_func=STAT_LABEL.get,
-                               placeholder="Όλες", key="arc_s")
-        side = st.segmented_control("Πλευρά", ["over", "under"], format_func=str.title, key="arc_side")
+        st.caption("Ετυμηγορία, πλευρά, αγορές και αγωνιστικές διαλέγονται στην κορυφή της σελίδας.")
         hid_mode = (st.segmented_control(
             f"Κρυμμένα από σένα ({n_hid})", ["all", "visible", "hidden"], default="all", key="arc_hid",
             format_func={"all": "Όλα", "visible": "Χωρίς", "hidden": "Μόνο αυτά"}.get) or "all") if n_hid else "all"
@@ -2333,8 +2370,7 @@ def page_archive(D, d: pd.DataFrame | None = None):
         use_mx = st.toggle(f"Μόνο τυπική απόδοση έως {mx:.2f}", True, key="arc_mx",
                            help="Το όριο των Ρυθμίσεων. Οι παλιές καταγραφές έγιναν πριν μπει, οπότε έτσι τα ποσοστά βγαίνουν σαν να ίσχυε από την αρχή.")
         st.divider()
-    v = d[d["verdict"].isin(vs)]
-    v = v[v["excluded"] == (1 if view == "exc" else 0)]
+    v = d[d["excluded"] == (1 if view == "exc" else 0)]
     if use_mx:
         v = v[v["price_typ"] <= mx]
     tg_ok = tg[tg["before"]] if only_before else tg
@@ -2350,10 +2386,6 @@ def page_archive(D, d: pd.DataFrame | None = None):
         v = v[v["hidden"] == 0]
     elif hid_mode == "hidden":
         v = v[v["hidden"] == 1]
-    if stats:
-        v = v[v["stat"].isin(stats)]
-    if side:
-        v = v[v["side"] == side]
     v = v.assign(_game=[game_label(gd, t, o) for gd, t, o in zip(v["game_date"], v["team"], v["opp"])])
     v = study_filters(v, D, "af", price="price_typ", prob="p_final", ev="ev", team="team", opp="opp",
                       game="_game", pid="player_id", minutes="min_hat", player="player", container=filt)
@@ -2544,7 +2576,8 @@ def page_results(D, sig):
     st.title("Αποτελέσματα")
     d = add_round(PK.load(con))
     d_f, sel, scope = round_picker(d, "res_rounds")
-    results_headline(d_f, scope)
+    d_f, what = category_picker(d_f) if len(d_f) else (d_f, "«Αξίζει»")
+    results_headline(d_f, scope, what)
     t1, t2, t3 = st.tabs(["Αρχείο «Αξίζει»", "Ημερολόγιο", "Έλεγχος μοντέλου"])
     with t1:
         page_archive(D, d_f)
