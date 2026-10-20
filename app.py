@@ -1251,12 +1251,19 @@ def roster_body(D, nxt, game=None):
 STATUS = {"open": "⏳ Ανοιχτό", "won": "✅ Κέρδισε", "lost": "❌ Έχασε", "push": "↔️ Ισοπαλία", "void": "🚫 Ακυρώθηκε"}
 
 
-def page_bets(D, embedded: bool = False):
+def page_bets(D, embedded: bool = False, rounds=None):
     if not embedded:
         st.title("Ημερολόγιο")
     st.markdown('<div class="el-sub">Ό,τι έπαιξες εσύ. Το αποτέλεσμα συμπληρώνεται μόνο του μετά τον αγώνα.</div>',
                 unsafe_allow_html=True)
     d = BT.load(con)
+    any_bets = len(d) > 0
+    if rounds and len(d):
+        d = add_round(d)
+        d = d[pd.Series(list(zip(d["season"], d["round"]))).isin(set(rounds)).to_numpy()].reset_index(drop=True)
+    if d.empty and rounds and any_bets:
+        st.info("Δεν έπαιξες τίποτα σε αυτές τις αγωνιστικές.")
+        return
     if d.empty:
         st.info("Δεν έχεις καταγράψει στοιχήματα. Στην ανάλυση ενός στοιχήματος πάτα «📝 Το έπαιξα».")
         return
@@ -2162,6 +2169,74 @@ def _edge_verdict(sm) -> tuple[str, str, str]:
         f'Διαφορά από την αγορά {edge * 100:+.1f} μονάδες, μέσα στο περιθώριο τύχης ±{sm["hit_band"] * 100:.0f}.')
 
 
+def add_round(d: pd.DataFrame) -> pd.DataFrame:
+    """Προσθέτει τη στήλη round (αγωνιστική) από το πρόγραμμα αγώνων."""
+    if d.empty or "season" not in d:
+        return d.assign(round=pd.Series(dtype=float))
+    g = pd.read_sql_query("SELECT season, game_code, round FROM games", con)
+    d = d.drop(columns=["round"], errors="ignore").merge(g, on=["season", "game_code"], how="left")
+    return d
+
+
+def round_label(season, rnd, multi_season: bool) -> str:
+    return (f"{int(season) % 100:02d}-{(int(season) + 1) % 100:02d} · " if multi_season else "") + f"Αγ. {int(rnd)}"
+
+
+def round_picker(d: pd.DataFrame, key: str):
+    """Επιλογή αγωνιστικών. Επιστρέφει (φιλτραρισμένο d, λίστα (σεζόν, αγωνιστική) ή None για όλες, περιγραφή)."""
+    rr = d.dropna(subset=["round"])[["season", "round"]].drop_duplicates().sort_values(["season", "round"])
+    opts = [(int(a), int(b)) for a, b in zip(rr["season"], rr["round"])]
+    multi = rr["season"].nunique() > 1
+    if len(opts) < 2:
+        return d, None, "όλες οι αγωνιστικές"
+    st.session_state[key] = [o for o in st.session_state.get(key, []) if o in opts]
+    sel = st.pills("Αγωνιστικές", opts, selection_mode="multi", key=key,
+                   format_func=lambda o: round_label(o[0], o[1], multi),
+                   help="Διάλεξε μία ή περισσότερες. Χωρίς επιλογή μετράνε όλες.") or []
+    if not sel:
+        return d, None, "όλες οι αγωνιστικές"
+    keep = pd.Series(list(zip(d["season"], d["round"]))).isin(set(sel)).to_numpy()
+    lab = ("αγωνιστική " if len(sel) == 1 else "αγωνιστικές ") + ", ".join(str(r) for _, r in sorted(sel))
+    return d[keep], sel, lab
+
+
+def per_round(target, base: pd.DataFrame):
+    """Κέρδος ανά αγωνιστική: μπάρες, και πίνακας για όποιον θέλει τα νούμερα."""
+    s = base[base["status"].isin(["won", "lost"])].dropna(subset=["round"])
+    if s["round"].nunique() < 2:
+        return
+    multi = s["season"].nunique() > 1
+    rows = []
+    for (se, rd), x in s.groupby(["season", "round"]):
+        sm = PK.summary(x)
+        rows.append({"Αγωνιστική": round_label(se, rd, multi), "Κλεισμένα": sm["n"], "Βγήκαν": 100 * sm["hit"],
+                     "Αγορά": 100 * sm["exp_market"], "Μοντέλο": 100 * sm["exp_model"], "Μονάδες": sm["units"],
+                     "Απόδ. επένδυσης": 100 * sm["roi"], "Κίνηση αγοράς": np.nan if sm["clv"] is None else 100 * sm["clv"]})
+    T = pd.DataFrame(rows)
+    T["Πρόσημο"] = np.where(T["Μονάδες"] >= 0, "κέρδος", "ζημιά")
+    heading(target, "Ανά αγωνιστική", sw(V_COLOR["strong"], "κέρδος") + sw(V_COLOR["suspect"], "ζημιά")
+            + "Μονάδες με 1 μονάδα σε κάθε «Αξίζει». Μία αγωνιστική μόνη της είναι κυρίως τύχη.")
+    base_ = alt.Chart(T).encode(x=alt.X("Αγωνιστική:N", sort=list(T["Αγωνιστική"]), title=None, axis=alt.Axis(labelAngle=0)))
+    bars = base_.mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3, size=min(46, 420 // len(T))).encode(
+        y=alt.Y("Μονάδες:Q", title=None),
+        color=alt.Color("Πρόσημο:N", scale=alt.Scale(domain=["κέρδος", "ζημιά"], range=[V_COLOR["strong"], V_COLOR["suspect"]]), legend=None),
+        tooltip=["Αγωνιστική", "Κλεισμένα", alt.Tooltip("Βγήκαν:Q", format=".0f", title="Βγήκαν %"),
+                 alt.Tooltip("Αγορά:Q", format=".0f", title="Περίμενε η αγορά %"), alt.Tooltip("Μονάδες:Q", format="+.1f"),
+                 alt.Tooltip("Απόδ. επένδυσης:Q", format="+.1f", title="Απόδ. επένδυσης %")])
+    txt = base_.mark_text(dy=-8, color=TEXT, font="Commissioner", fontSize=11).encode(
+        y=alt.Y("Μονάδες:Q"), text=alt.Text("Μονάδες:Q", format="+.1f"))
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=HAIR).encode(y="y:Q")
+    show_chart(target, (zero + bars + txt).properties(height=220))
+    with target.expander("Ανά αγωνιστική αναλυτικά"):
+        st.dataframe(T.drop(columns=["Πρόσημο"]), hide_index=True, width="stretch", column_config={
+            "Βγήκαν": st.column_config.NumberColumn(format="%.0f%%"),
+            "Αγορά": st.column_config.NumberColumn(format="%.0f%%", help="Τι περίμενε η αγορά."),
+            "Μοντέλο": st.column_config.NumberColumn(format="%.0f%%", help="Τι περίμενε το μοντέλο."),
+            "Μονάδες": st.column_config.NumberColumn(format="%+.1f", help=GLOSS["Μονάδα"]),
+            "Απόδ. επένδυσης": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Κίνηση αγοράς": st.column_config.NumberColumn(format="%+.1f%%", help=GLOSS["Κίνηση αγοράς"])})
+
+
 def _units_chart(target, s: pd.DataFrame, height: int = 240):
     s = s.sort_values(["game_date", "id"]).reset_index(drop=True)
     s["n"] = np.arange(1, len(s) + 1)
@@ -2175,15 +2250,23 @@ def _units_chart(target, s: pd.DataFrame, height: int = 240):
         strokeDash=alt.StrokeDash("Σειρά:N", scale=alt.Scale(domain=["Πραγματικό", "Αναμενόμενο"], range=[[1, 0], [5, 4]]), legend=None),
         tooltip=["Σειρά", alt.Tooltip("n:Q", title="Στοίχημα"), alt.Tooltip("u:Q", format="+.2f", title="Μονάδες")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=HAIR).encode(y="y:Q")
-    show_chart(target, (zero + ch).properties(height=height))
+    layers = [zero, ch]
+    if "round" in s and s["round"].nunique() > 1:
+        st_ = s.dropna(subset=["round"]).groupby(["season", "round"])["n"].min().reset_index()
+        st_ = st_[st_["n"] > 1]
+        st_["t"] = [f"Αγ. {int(r)}" for r in st_["round"]]
+        layers += [alt.Chart(st_).mark_rule(color=MUTED, strokeDash=[2, 3], opacity=.6).encode(x="n:Q"),
+                   alt.Chart(st_).mark_text(align="left", dx=3, dy=6, color=MUTED, fontSize=10, font="Commissioner")
+                   .encode(x="n:Q", y=alt.value(0), text="t:N")]
+    show_chart(target, alt.layer(*layers).properties(height=height))
 
 
-def results_headline(d: pd.DataFrame):
+def results_headline(d: pd.DataFrame, scope: str = "όλες οι αγωνιστικές"):
     """Το σκορ με μια ματιά: τα «Αξίζει» του Αρχείου, με τους τωρινούς κανόνες, χωρίς τις εξαιρέσεις."""
     mx = max_odds()
     base = d[(d["verdict"] == "strong") & (d["excluded"] == 0) & (d["price_typ"] <= mx)] if len(d) else d
     if base.empty:
-        st.info("Δεν έχει καταγραφεί τίποτα ακόμα. Κάθε «Αξίζει» καταγράφεται μόνο του τη στιγμή που εμφανίζεται.")
+        st.info("Τίποτα καταγεγραμμένο εδώ ακόμα. Κάθε «Αξίζει» καταγράφεται μόνο του τη στιγμή που εμφανίζεται.")
         return
     sm = PK.summary(base)
     if not sm["n"]:
@@ -2192,7 +2275,7 @@ def results_headline(d: pd.DataFrame):
     GOODC, BADC = V_COLOR["strong"], V_COLOR["suspect"]
     vc, t, msg = _edge_verdict(sm)
     st.markdown(f'<div class="el-verdict" style="--vc:{vc}"><div class="t"><b>{esc(t)}</b></div><div class="s">{esc(msg)}</div>'
-                f'<div class="m">Όλα τα «Αξίζει» που κατέγραψε μόνη της η εφαρμογή: {sm["n"]} κλεισμένα σε {sm["games"]} αγώνες, '
+                f'<div class="m">Τα «Αξίζει» που κατέγραψε μόνη της η εφαρμογή, {esc(scope)}: {sm["n"]} κλεισμένα σε {sm["games"]} αγώνες, '
                 f'{sm["n_open"]} ανοιχτά. Τυπική απόδοση έως {mx:.2f}, χωρίς όσα εξαίρεσες.</div></div>', unsafe_allow_html=True)
     col_u = GOODC if sm["units"] > 0 else BADC if sm["units"] < 0 else None
     edge = sm["hit"] - sm["exp_market"]
@@ -2208,17 +2291,21 @@ def results_headline(d: pd.DataFrame):
          f'Βγήκαν. Το μοντέλο περίμενε {pct(sm["exp_model"])}, η αγορά {pct(sm["exp_market"])}.', col_h),
     ])
     s = base[base["status"].isin(["won", "lost"])]
+    many = s["round"].nunique() > 1 if "round" in s else False
+    a, b = (st, st) if (is_mobile() or not many) else st.columns([3, 2], gap="large")
     if len(s) >= 2:
-        heading(st, "Πορεία σε μονάδες", sw(BLUE, "πραγματικό", "ln") + sw(MUTED, "αναμενόμενο από το μοντέλο", "ln dash")
+        heading(a, "Πορεία σε μονάδες", sw(BLUE, "πραγματικό", "ln") + sw(MUTED, "αναμενόμενο από το μοντέλο", "ln dash")
                 + "Αν η μπλε μένει σταθερά κάτω από τη διακεκομμένη, το μοντέλο είναι αισιόδοξο.")
-        _units_chart(st, s, 220)
+        _units_chart(a, s, 220)
+    if many:
+        per_round(b, base)
 
 
-def page_archive(D):
+def page_archive(D, d: pd.DataFrame | None = None):
     """Το Αρχείο «Αξίζει» αναλυτικά: φίλτρα, ανά αγορά, ανά ετικέτα, όλες οι καταγραφές."""
-    d = PK.load(con)
+    d = add_round(PK.load(con)) if d is None else d
     if d.empty:
-        st.info("Δεν έχει καταγραφεί τίποτα ακόμα.")
+        st.info("Τίποτα καταγεγραμμένο εδώ ακόμα.")
         return
     mob = is_mobile()
     tags_all = PK.all_tags(con)
@@ -2364,7 +2451,8 @@ def page_archive(D):
 
     heading(st, "Όλες οι καταγραφές", "Βάλε ετικέτες ή εξαίρεσε στοιχήματα απευθείας στον πίνακα. Καλύτερα πριν τον αγώνα.")
     w = v.assign(
-        Αγώνας=v["game_date"].dt.tz_convert("Europe/Athens").dt.strftime("%d/%m"),
+        Αγώνας=[f"{d_:%d/%m}" + ("" if pd.isna(r_) else f" · Αγ.{int(r_)}")
+                for d_, r_ in zip(v["game_date"].dt.tz_convert("Europe/Athens"), v["round"])],
         Παίκτης=[short(n) if mob else n.title() for n in v["player"]],
         Στοίχημα=[f"{'Over' if sd_ == 'over' else 'Under'} {ln:g} {STAT_LABEL.get(stt, stt)}" for sd_, ln, stt in zip(v["side"], v["line"], v["stat"])],
         Ετυμηγορία=v["verdict"].map(V_NAME),
@@ -2454,12 +2542,14 @@ def back_button():
 
 def page_results(D, sig):
     st.title("Αποτελέσματα")
-    results_headline(PK.load(con))
+    d = add_round(PK.load(con))
+    d_f, sel, scope = round_picker(d, "res_rounds")
+    results_headline(d_f, scope)
     t1, t2, t3 = st.tabs(["Αρχείο «Αξίζει»", "Ημερολόγιο", "Έλεγχος μοντέλου"])
     with t1:
-        page_archive(D)
+        page_archive(D, d_f)
     with t2:
-        page_bets(D, embedded=True)
+        page_bets(D, embedded=True, rounds=sel)
     with t3:
         page_model(D, sig, embedded=True)
 
