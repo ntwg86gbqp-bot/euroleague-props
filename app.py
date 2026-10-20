@@ -1353,8 +1353,9 @@ def refresh_odds(D) -> str:
         res = O.fetch_oddspapi(cfg["oddspapi_key"], cfg.get("books", ""), 7)
         n, unmatched = O.store(con, res["rows"], O.PlayerIndex(D["current"]), "oddspapi")
     except Exception as e:  # noqa: BLE001
+        O.save_config({**O.load_config(), "odds_fail_at": pd.Timestamp.now(tz="UTC").isoformat()})
         return f"Οι αποδόσεις δεν ανανεώθηκαν: {e}"
-    O.save_config({**cfg, "odds_at": pd.Timestamp.now(tz="UTC").isoformat()})
+    O.save_config({**O.load_config(), "odds_at": pd.Timestamp.now(tz="UTC").isoformat()})
     if not n:
         return "Το OddsPapi δεν έδωσε ειδικά παικτών για τους επόμενους αγώνες."
     return f"Πέρασαν {n} αποδόσεις από {res['n_upcoming']} αγώνες." + (f" {len(unmatched)} παίκτες δεν αναγνωρίστηκαν." if unmatched else "")
@@ -2716,8 +2717,11 @@ else:
         st.session_state["rec_err"] = str(e)
     if page == "Αγωνιστική":
         cfg_ = O.load_config()
-        stale = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(cfg_.get("odds_at", "2000-01-01T00:00:00+00:00"))) > pd.Timedelta(hours=6)
-        if cfg_.get("oddspapi_key") and stale and not st.session_state.get("auto_odds_done"):
+        now_ = pd.Timestamp.now(tz="UTC")
+        stale = (now_ - pd.Timestamp(cfg_.get("odds_at", "2000-01-01T00:00:00+00:00"))) > pd.Timedelta(hours=6)
+        # μετά από αποτυχία (π.χ. όριο αιτημάτων) όχι νέα αυτόματη προσπάθεια για 20′, από καμία συσκευή
+        cool = (now_ - pd.Timestamp(cfg_.get("odds_fail_at", "2000-01-01T00:00:00+00:00"))) > pd.Timedelta(minutes=20)
+        if cfg_.get("oddspapi_key") and stale and cool and not st.session_state.get("auto_odds_done"):
             st.session_state["auto_odds_done"] = True       # μία προσπάθεια ανά άνοιγμα της εφαρμογής
             with st.spinner("Ανανέωση αποδόσεων…"):
                 st.session_state["odds_msg"] = refresh_odds(D)

@@ -166,7 +166,14 @@ def _get(path: str, key: str, **params):
     for attempt in range(4):
         r = requests.get(f"{BASE}/{path}", params=q, timeout=120)
         if r.status_code == 429:
-            time.sleep(3 * (attempt + 1))
+            # όσο ζητάει το ίδιο το API (Retry-After), αλλιώς 3, 6, 9 δευτερόλεπτα· ποτέ πάνω από 20
+            try:
+                wait = float(r.headers.get("Retry-After", ""))
+            except ValueError:
+                wait = 3.0 * (attempt + 1)
+            if wait > 20:
+                break
+            time.sleep(max(wait, 1.0))
             continue
         if r.status_code == 404:
             return None
@@ -175,13 +182,68 @@ def _get(path: str, key: str, **params):
         r.raise_for_status()
         time.sleep(1.1)  # cooldown ανά endpoint
         return r.json()
-    raise OddsPapiError(f"Όριο αιτημάτων στο /{path}")
+    raise OddsPapiError(f"το OddsPapi κόβει προσωρινά τα αιτήματα (/{path}). Ξαναδοκίμασε σε λίγα λεπτά.")
+
+
+MARKETS_MAX_AGE = dt.timedelta(days=7)
+
+
+def _markets_cache() -> tuple[dict | None, dt.datetime | None]:
+    """Η αποθηκευμένη λίστα αγορών και πότε κατέβηκε. Στη βάση (σώζεται και στο cloud), αλλιώς σε αρχείο."""
+    if _CON is not None:
+        try:
+            _CON.execute("CREATE TABLE IF NOT EXISTS api_cache(key TEXT PRIMARY KEY, value TEXT, at TEXT)")
+            r = _CON.execute("SELECT value, at FROM api_cache WHERE key='oddspapi_markets'").fetchone()
+            if r:
+                return json.loads(r[0]), dt.datetime.fromisoformat(r[1])
+        except Exception:  # noqa: BLE001
+            pass
+    if MARKETS_CACHE.exists():
+        at = dt.datetime.fromtimestamp(MARKETS_CACHE.stat().st_mtime, dt.timezone.utc)
+        try:
+            return json.loads(MARKETS_CACHE.read_text()), at
+        except Exception:  # noqa: BLE001
+            pass
+    return None, None
+
+
+def _save_markets(out: dict) -> None:
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    if _CON is not None:
+        try:
+            _CON.execute("CREATE TABLE IF NOT EXISTS api_cache(key TEXT PRIMARY KEY, value TEXT, at TEXT)")
+            _CON.execute("INSERT OR REPLACE INTO api_cache VALUES ('oddspapi_markets', ?, ?)", (json.dumps(out), now))
+            _CON.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        MARKETS_CACHE.write_text(json.dumps(out))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def prop_markets(key: str, refresh: bool = False) -> dict[str, dict]:
-    """marketId -> {name, stat, line, outcomes{outcomeId: side}} για ειδικά παικτών μπάσκετ."""
-    if MARKETS_CACHE.exists() and not refresh:
-        return json.loads(MARKETS_CACHE.read_text())
+    """marketId -> {name, stat, line, outcomes{outcomeId: side}} για ειδικά παικτών μπάσκετ.
+
+    Η λίστα σχεδόν δεν αλλάζει και το /markets είναι το βαρύτερο αίτημα του API: κρατιέται 7 ημέρες.
+    Αν η ανανέωσή της αποτύχει (π.χ. όριο αιτημάτων), χρησιμοποιείται η παλιά."""
+    cached, at = _markets_cache()
+    fresh = cached is not None and at is not None and dt.datetime.now(dt.timezone.utc) - at < MARKETS_MAX_AGE
+    if cached and fresh and not refresh:
+        return cached
+    try:
+        out = _download_markets(key)
+    except (OddsPapiError, requests.RequestException):
+        if cached:
+            return cached
+        raise
+    if out:
+        _save_markets(out)
+    return out or (cached or {})
+
+
+def _download_markets(key: str) -> dict[str, dict]:
     out = {}
     for m in _get("markets", key) or []:
         if m.get("sportId") != BASKETBALL_SPORT or not m.get("playerProp"):
@@ -191,8 +253,6 @@ def prop_markets(key: str, refresh: bool = False) -> dict[str, dict]:
             "line": m.get("handicap"),
             "outcomes": {str(o["outcomeId"]): side_from_outcome(o.get("outcomeName", ""))
                          for o in m.get("outcomes", [])}}
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    MARKETS_CACHE.write_text(json.dumps(out))
     return out
 
 
@@ -223,19 +283,26 @@ def parse_fixture_odds(odds: dict, markets: dict[str, dict]) -> tuple[list[dict]
 def fetch_oddspapi(key: str, bookmakers: str = DEFAULT_BOOKS, days: int = 7,
                    progress=None) -> dict:
     """Τραβάει ειδικά παικτών για τα επερχόμενα παιχνίδια Euroleague."""
-    markets = prop_markets(key, refresh=True)
+    markets = prop_markets(key)
     now = dt.datetime.now(dt.timezone.utc)
     fixtures = _get("fixtures", key, tournamentId=EUROLEAGUE_TOURNAMENT,
                     **{"from": now.strftime("%Y-%m-%d"),
                        "to": (now + dt.timedelta(days=days)).strftime("%Y-%m-%d")}) or []
     iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     upcoming = [f for f in fixtures if f.get("hasOdds") and f.get("startTime", "") > iso]
-    rows, unknown = [], set()
+    raw = []
     for i, f in enumerate(upcoming):
         if progress:
             progress((i + 1) / len(upcoming),
                      f"{f.get('participant1Name')} - {f.get('participant2Name')}")
-        o = _get("odds", key, fixtureId=f["fixtureId"], bookmakers=bookmakers or None)
+        raw.append(_get("odds", key, fixtureId=f["fixtureId"], bookmakers=bookmakers or None))
+    # αγορές που δεν ξέρουμε: ίσως πρόσθεσε νέες το API. Ανανέωση της λίστας, αλλά το πολύ μία φορά τη μέρα.
+    seen = {str(mid) for o in raw for b in (o or {}).get("bookmakerOdds", {}).values() for mid in (b.get("markets") or {})}
+    _, at = _markets_cache()
+    if seen - set(markets) and (at is None or now - at > dt.timedelta(days=1)):
+        markets = prop_markets(key, refresh=True)
+    rows, unknown = [], set()
+    for o in raw:
         r, u = parse_fixture_odds(o, markets)
         rows += r
         unknown |= u
